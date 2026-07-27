@@ -7,6 +7,7 @@ from pydantic import BaseModel
 from tau2.agent.discrete_time_audio_native_agent import (
     create_discrete_time_audio_native_agent,
 )
+from tau2.agent.jlens_agent import create_jlens_direct_solo_agent
 from tau2.agent.llm_agent import (
     LLMGTAgent,
     LLMSoloAgent,
@@ -305,6 +306,12 @@ try:
         "llm_agent_solo",
         task_filter=LLMSoloAgent.check_valid_task,
         metadata={"solo_mode": True},
+    )
+    registry.register_agent_factory(
+        create_jlens_direct_solo_agent,
+        "jlens_direct_solo",
+        task_filter=LLMSoloAgent.check_valid_task,
+        metadata={"solo_mode": True, "jlens_variant": "direct"},
     )
     registry.register_agent_factory(
         create_discrete_time_audio_native_agent,

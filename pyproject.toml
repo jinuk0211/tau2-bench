@@ -74,8 +74,11 @@ experiments = [
     "seaborn>=0.13.2",
     "scikit-learn>=1.6.1",
 ]
+jlens = [
+    "jlens",
+]
 all = [
-    "tau2[voice,knowledge,gym,dev,experiments]",
+    "tau2[voice,knowledge,gym,dev,experiments,jlens]",
 ]
 [project.urls]
 Homepage = "https://taubench.com/"
@@ -101,3 +104,6 @@ ignore = ["E501", "F541"]
 [tool.ruff]
 line-length = 88
 exclude = ["*.ipynb"]
+
+[tool.uv.sources]
+jlens = { path = "../jacobian-lens", editable = true }
