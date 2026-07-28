@@ -156,14 +156,14 @@ def build_user(
     """
     UserConstructor = registry.get_user_constructor(user_name)
 
+    if issubclass(UserConstructor, DummyUser):
+        assert solo_mode, "Dummy user can only be used with solo agent"
+        return UserConstructor()
+
     try:
         user_tools = environment.get_user_tools(include=task.user_tools) or None
     except Exception:
         user_tools = None
-
-    # Validate DummyUser usage
-    if issubclass(UserConstructor, DummyUser):
-        assert solo_mode, "Dummy user can only be used with solo agent"
 
     user_kwargs = {
         "tools": user_tools,
