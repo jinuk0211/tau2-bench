@@ -4,10 +4,12 @@ set -Eeuo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: bash scripts/setup_and_run_jlens.sh --pilot|--full
+Usage: bash scripts/setup_and_run_jlens.sh (--pilot|--full) [--start N] [--count N]
 
   --pilot  Analyze catalog positions 50..51 (one airline + one retail task).
   --full   Analyze positions 1..164 (all 50 airline + all 114 retail tasks).
+  --start  Override the mode's one-based catalog start position.
+  --count  Override the mode's number of consecutive tasks.
 
 Optional environment variables:
   OPENAI_API_KEY       OpenAI key for the user simulator; prompted if unset.
@@ -19,12 +21,56 @@ EOF
 }
 
 MODE=""
-case "${1:-}" in
-  --pilot) MODE="pilot" ;;
-  --full) MODE="full" ;;
-  -h|--help) usage; exit 0 ;;
-  *) usage >&2; exit 2 ;;
-esac
+START_OVERRIDE=""
+COUNT_OVERRIDE=""
+while (( $# > 0 )); do
+  case "$1" in
+    --pilot|--full)
+      if [[ -n "${MODE}" ]]; then
+        echo "ERROR: choose exactly one of --pilot or --full." >&2
+        exit 2
+      fi
+      MODE="${1#--}"
+      shift
+      ;;
+    --start|--count)
+      option="$1"
+      if (( $# < 2 )); then
+        echo "ERROR: ${option} requires a positive integer." >&2
+        exit 2
+      fi
+      if [[ "${option}" == "--start" ]]; then
+        START_OVERRIDE="$2"
+      else
+        COUNT_OVERRIDE="$2"
+      fi
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "ERROR: unknown argument: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+if [[ -z "${MODE}" ]]; then
+  usage >&2
+  exit 2
+fi
+
+if [[ -n "${START_OVERRIDE}" && ! "${START_OVERRIDE}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "ERROR: --start must be a positive integer." >&2
+  exit 2
+fi
+if [[ -n "${COUNT_OVERRIDE}" && ! "${COUNT_OVERRIDE}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "ERROR: --count must be a positive integer." >&2
+  exit 2
+fi
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORKSPACE_DIR="$(dirname "${PROJECT_DIR}")"
@@ -54,8 +100,22 @@ else
   RUN_DESCRIPTION="Airline 50 tasks + Retail 114 tasks"
 fi
 
+CUSTOM_RANGE=0
+if [[ -n "${START_OVERRIDE}" ]]; then
+  START="${START_OVERRIDE}"
+  CUSTOM_RANGE=1
+fi
+if [[ -n "${COUNT_OVERRIDE}" ]]; then
+  COUNT="${COUNT_OVERRIDE}"
+  CUSTOM_RANGE=1
+fi
+
 END=$((START + COUNT - 1))
 RUN_LABEL="$(printf "%04d-%04d" "${START}" "${END}")"
+if (( CUSTOM_RANGE )); then
+  RUN_NAME="tau2-range"
+  RUN_DESCRIPTION="Catalog positions ${START}..${END}"
+fi
 TRACE_ROOT="${RESULTS_ROOT}/${RUN_NAME}-traces"
 TRACE_DIR="${TRACE_ROOT}/${RUN_LABEL}"
 RESULT_DIR="${RESULTS_ROOT}/${RUN_NAME}-jlens-${STAMP}"

@@ -44,6 +44,13 @@ Run the two-task boundary pilot first:
 bash scripts/setup_and_run_jlens.sh --pilot
 ```
 
+To run the first two catalog positions instead (airline task IDs 0 and 1),
+override the pilot range at invocation time:
+
+```bash
+bash scripts/setup_and_run_jlens.sh --pilot --start 1 --count 2
+```
+
 Then run all 50 airline and 114 retail tasks:
 
 ```bash
