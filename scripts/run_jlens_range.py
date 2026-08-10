@@ -191,6 +191,11 @@ def _build_config(
     conversational = domain in {"airline", "retail"}
     return TextRunConfig(
         domain=domain,
+        # The combined catalog is built from the complete domain task set.
+        # Keep execution on that same unfiltered set instead of TextRunConfig's
+        # default ``base`` split, otherwise persona-expanded telecom IDs that
+        # appear in the catalog cannot be resolved by run_domain().
+        task_split_name=None,
         task_ids=task_ids,
         agent="jlens_hf_agent" if conversational else "jlens_direct_solo",
         llm_agent=profile["model_id"],
