@@ -32,6 +32,28 @@ Ranges containing airline or retail require an OpenAI-compatible user-model
 endpoint. Override its defaults with `-UserModel` and `-UserApiBase`. Telecom
 is run in direct solo mode and does not require that endpoint.
 
+## Linux/Vast.ai: progress-friendly airline and retail runs
+
+The Linux runner prints the active phase plus elapsed time, GPU utilization,
+trace count, and completed-view count every 15 seconds. It prompts for the
+OpenAI user-simulator key without echoing it and never starts an HTTP server.
+
+Run the two-task boundary pilot first:
+
+```bash
+bash scripts/setup_and_run_jlens.sh --pilot
+```
+
+Then run all 50 airline and 114 retail tasks:
+
+```bash
+bash scripts/setup_and_run_jlens.sh --full
+```
+
+Trace paths are stable so re-running the same mode can auto-resume generation.
+Each analysis attempt uses a new result directory, preventing an old error
+manifest from being overwritten.
+
 The analyzer never reconstructs a prompt from log text. It uses the recorded
 `input_ids + generated_ids`, validates their hashes, and refuses to truncate a
 trace. By default it includes every token position, every fourth fitted lens
