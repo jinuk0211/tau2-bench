@@ -1,9 +1,10 @@
-"""Run one global task range across airline, retail, and telecom.
+"""Run a global tau2 task range through a hosted vLLM agent.
 
-The catalog is always ordered as airline -> retail -> telecom. ``--start`` is
-one-based and ``--count`` is the number of catalog entries to run. The runner
-automatically uses the conversational J-Lens agent for airline/retail and the
-direct solo J-Lens agent for telecom.
+The catalog is ordered as airline -> retail -> telecom. ``--start`` is
+one-based and ``--count`` selects consecutive catalog entries.  Unlike the
+offline J-Lens replay step, this command only generates normal tau2 results and
+verbose LLM logs.  Those logs are later teacher-forced through Transformers so
+trajectory generation stays comparable with the GPT-OSS benchmark runs.
 """
 
 from __future__ import annotations
@@ -11,7 +12,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import sys
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,27 +19,19 @@ from typing import Any, Sequence
 
 from tau2.data_model.simulation import TextRunConfig
 from tau2.data_model.tasks import Task
+from tau2.jlens.profiles import PROFILES
 from tau2.run import get_tasks, run_domain
+from tau2.utils.llm_utils import set_llm_log_mode
 
 DOMAIN_ORDER = ("airline", "retail", "telecom")
 MODEL_PROFILES = {
-    "qwen3-8b": {
-        "model_id": "Qwen/Qwen3-8B",
-        "revision": "b968826d9c46dd6066d109eabc6255188de91218",
-    },
-    "qwen3.5-4b": {
-        "model_id": "Qwen/Qwen3.5-4B",
-        "revision": "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a",
-    },
-    "qwen3.5-9b-base": {
-        "model_id": "Qwen/Qwen3.5-9B-Base",
-        "revision": "68c46c4b3498877f3ef123c856ecfde50c39f404",
-        "diagnostic_only": True,
-    },
-    "qwen3.6-27b": {
-        "model_id": "Qwen/Qwen3.6-27B",
-        "revision": "6a9e13bd6fc8f0983b9b99948120bc37f49c13e9",
-    },
+    name: {
+        "model_id": profile.model_id,
+        "revision": profile.model_revision,
+        "served_model": profile.model_id.rsplit("/", 1)[-1],
+        "diagnostic_only": name.endswith("-base"),
+    }
+    for name, profile in PROFILES.items()
 }
 
 
@@ -101,41 +93,58 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Number of consecutive combined-catalog tasks (default: 1)",
     )
     parser.add_argument(
-        "--profile", choices=tuple(MODEL_PROFILES), default="qwen3-8b"
+        "--profile", choices=tuple(MODEL_PROFILES), default="qwen3.5-4b"
     )
     parser.add_argument("--num-trials", type=int, default=1)
-    parser.add_argument("--max-concurrency", type=int, default=1)
-    parser.add_argument("--max-new-tokens", type=int, default=256)
+    parser.add_argument("--max-concurrency", type=int, default=4)
+    parser.add_argument("--seed", type=int, default=300)
+    parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument(
-        "--dtype",
-        choices=("auto", "float16", "bfloat16", "float32"),
-        default="bfloat16",
+        "--max-tokens",
+        "--max-new-tokens",
+        dest="max_tokens",
+        type=int,
+        default=4096,
+        help="Maximum generated agent tokens (default: 4096)",
+    )
+    parser.add_argument(
+        "--agent-api-base",
+        default=os.getenv("HOSTED_VLLM_API_BASE", "http://127.0.0.1:8000/v1"),
+        help="OpenAI-compatible vLLM endpoint",
     )
     parser.add_argument(
         "--user-model",
-        default=os.getenv("TAU2_USER_MODEL", "openai/qwen3:8b"),
-        help="LiteLLM user-simulator model for airline/retail",
+        default=os.getenv("TAU2_USER_MODEL", "gpt-5.2-2025-12-11"),
+        help="LiteLLM model for the user simulator",
     )
     parser.add_argument(
         "--user-api-base",
-        default=os.getenv("TAU2_USER_API_BASE", "http://127.0.0.1:11434/v1"),
-        help="OpenAI-compatible endpoint used by the airline/retail user simulator",
+        default=os.getenv("TAU2_USER_API_BASE", "https://api.openai.com/v1"),
+        help="OpenAI-compatible endpoint used by the user simulator",
     )
-    parser.add_argument("--trace-root", type=Path, default=Path("data/jlens_traces"))
-    parser.add_argument("--save-prefix", default="jlens-range")
+    parser.add_argument(
+        "--trajectory-root",
+        "--trace-root",
+        dest="trajectory_root",
+        type=Path,
+        default=Path("data/jlens_trajectories"),
+        help="Root for standard tau2 results and verbose LLM logs",
+    )
     parser.add_argument("--auto-resume", action="store_true")
     parser.add_argument(
         "--list-only",
         action="store_true",
-        help="Print counts and the selected range without loading a model",
+        help="Print counts and the selected range without contacting a model",
     )
     args = parser.parse_args(argv)
     if args.num_trials < 1:
         parser.error("--num-trials must be at least 1")
     if args.max_concurrency < 1:
         parser.error("--max-concurrency must be at least 1")
-    if args.max_new_tokens < 1:
-        parser.error("--max-new-tokens must be at least 1")
+    if args.max_tokens < 1:
+        parser.error("--max-tokens must be at least 1")
+    if args.temperature < 0:
+        parser.error("--temperature must be non-negative")
     return args
 
 
@@ -173,43 +182,38 @@ def _build_config(
     task_ids: list[str],
     run_label: str,
 ) -> TextRunConfig:
+    """Build the GPT-OSS-compatible online trajectory configuration."""
     profile = MODEL_PROFILES[args.profile]
-    trace_template = (
-        args.trace_root.resolve()
-        / run_label
-        / domain
-        / "{simulation_id}.jsonl"
-    )
+    run_dir = args.trajectory_root.resolve() / run_label / domain
     agent_args = {
-        "hf_revision": profile["revision"],
-        "jlens_mode": "off",
-        "jlens_telemetry_path": str(trace_template),
-        "hf_dtype": args.dtype,
-        "max_new_tokens": args.max_new_tokens,
-        "do_sample": False,
+        "api_base": args.agent_api_base.rstrip("/"),
+        "temperature": args.temperature,
+        "max_tokens": args.max_tokens,
+        "extra_body": {
+            "chat_template_kwargs": {"enable_thinking": False},
+        },
     }
-    conversational = domain in {"airline", "retail"}
+    user_args = {
+        "api_base": args.user_api_base.rstrip("/"),
+        "reasoning_effort": "low",
+    }
     return TextRunConfig(
         domain=domain,
-        # The combined catalog is built from the complete domain task set.
-        # Keep execution on that same unfiltered set instead of TextRunConfig's
-        # default ``base`` split, otherwise persona-expanded telecom IDs that
-        # appear in the catalog cannot be resolved by run_domain().
+        # The combined catalog uses the full domain task set, so execution must
+        # not silently apply the default ``base`` split afterward.
         task_split_name=None,
         task_ids=task_ids,
-        agent="jlens_hf_agent" if conversational else "jlens_direct_solo",
-        llm_agent=profile["model_id"],
+        agent="llm_agent",
+        llm_agent=f"hosted_vllm/{profile['served_model']}",
         llm_args_agent=agent_args,
-        user="user_simulator" if conversational else "dummy_user",
+        user="user_simulator",
         llm_user=args.user_model,
-        llm_args_user=(
-            {"api_base": args.user_api_base.rstrip("/"), "temperature": 0.0}
-            if conversational
-            else {}
-        ),
+        llm_args_user=user_args,
         num_trials=args.num_trials,
         max_concurrency=args.max_concurrency,
-        save_to=f"{args.save_prefix}-{run_label}-{domain}",
+        seed=args.seed,
+        save_to=str(run_dir),
+        verbose_logs=True,
         auto_resume=args.auto_resume,
     )
 
@@ -222,26 +226,44 @@ def main(argv: list[str] | None = None) -> int:
         selected = select_range(catalog, start=args.start, count=args.count)
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
+
     manifest = _selection_manifest(catalog, selected)
+    manifest["generation"] = {
+        "backend": "vllm",
+        "profile": args.profile,
+        "model": MODEL_PROFILES[args.profile]["model_id"],
+        "model_revision": MODEL_PROFILES[args.profile]["revision"],
+        "temperature": args.temperature,
+        "max_tokens": args.max_tokens,
+        "user_model": args.user_model,
+        "user_reasoning_effort": "low",
+        "seed": args.seed,
+        "max_concurrency": args.max_concurrency,
+        "verbose_logs": True,
+        "llm_log_mode": "all",
+    }
     print(json.dumps(manifest, ensure_ascii=False, indent=2))
     if args.list_only:
         return 0
 
-    if MODEL_PROFILES[args.profile].get("diagnostic_only"):
-        print(
-            "[J-Lens range] WARNING: Qwen3.5-9B-Base is pre-trained-only; "
-            "results are diagnostic and not an instruction/tool-use benchmark.",
-            file=sys.stderr,
+    if MODEL_PROFILES[args.profile]["diagnostic_only"]:
+        raise SystemExit(
+            f"{args.profile} is a base model and cannot generate a comparable "
+            "tool-use trajectory through the standard tau2 agent"
         )
 
-    os.environ.setdefault("OPENAI_API_KEY", "not-needed")
+    os.environ["HOSTED_VLLM_API_BASE"] = args.agent_api_base.rstrip("/")
+    os.environ.setdefault("HOSTED_VLLM_API_KEY", "dummy")
+    set_llm_log_mode("all")
+
     run_label = f"{selected[0].index:04d}-{selected[-1].index:04d}"
-    selection_dir = args.trace_root.resolve() / run_label
+    selection_dir = args.trajectory_root.resolve() / run_label
     selection_dir.mkdir(parents=True, exist_ok=True)
     (selection_dir / "selection.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
+
     grouped: dict[str, list[str]] = defaultdict(list)
     for entry in selected:
         grouped[entry.domain].append(str(entry.task.id))
@@ -250,7 +272,8 @@ def main(argv: list[str] | None = None) -> int:
         if not task_ids:
             continue
         print(
-            f"[J-Lens range] {domain}: running {len(task_ids)} selected task(s)",
+            f"[tau2 range] {domain}: running {len(task_ids)} selected task(s) "
+            "through vLLM",
             flush=True,
         )
         run_domain(
@@ -261,11 +284,11 @@ def main(argv: list[str] | None = None) -> int:
                 run_label=run_label,
             )
         )
-    print(f"[J-Lens range] traces: {selection_dir}")
+
+    print(f"[tau2 range] trajectories: {selection_dir}")
     print(
-        "[J-Lens range] analyze with: "
-        f"uv run tau2 jlens \"{selection_dir}\" --profile {args.profile} "
-        "--output-dir data/jlens_analysis --layer-stride 1"
+        "[tau2 range] vLLM can now be stopped; replay the verbose logs with "
+        "scripts/analyze_tau2.py from jacobian-lens"
     )
     return 0
 
@@ -274,5 +297,4 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except KeyboardInterrupt:
-        print("\n[J-Lens range] interrupted", file=sys.stderr)
         raise SystemExit(130) from None

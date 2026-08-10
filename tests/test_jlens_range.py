@@ -71,18 +71,19 @@ def test_global_range_rejects_invalid_or_partial_ranges(start, count):
         module.select_range(catalog, start=start, count=count)
 
 
-def test_run_config_uses_same_unfiltered_task_set_as_combined_catalog(tmp_path):
+def test_run_config_uses_gpt_oss_trajectory_path_and_full_task_set(tmp_path):
     module = _load_module()
     args = SimpleNamespace(
         profile="qwen3.5-4b",
-        trace_root=tmp_path,
-        dtype="bfloat16",
-        max_new_tokens=32,
-        user_model="openai/test-user",
-        user_api_base="http://127.0.0.1:11434/v1",
+        trajectory_root=tmp_path,
+        agent_api_base="http://127.0.0.1:8000/v1",
+        temperature=1.0,
+        max_tokens=4096,
+        user_model="gpt-5.2-2025-12-11",
+        user_api_base="https://api.openai.com/v1",
         num_trials=1,
-        max_concurrency=1,
-        save_prefix="test",
+        max_concurrency=4,
+        seed=300,
         auto_resume=False,
     )
 
@@ -95,3 +96,35 @@ def test_run_config_uses_same_unfiltered_task_set_as_combined_catalog(tmp_path):
 
     assert config.task_split_name is None
     assert config.task_ids == ["persona-expanded-task"]
+    assert config.agent == "llm_agent"
+    assert config.llm_agent == "hosted_vllm/Qwen3.5-4B"
+    assert config.llm_args_agent == {
+        "api_base": "http://127.0.0.1:8000/v1",
+        "temperature": 1.0,
+        "max_tokens": 4096,
+        "extra_body": {
+            "chat_template_kwargs": {"enable_thinking": False},
+        },
+    }
+    assert config.llm_user == "gpt-5.2-2025-12-11"
+    assert config.llm_args_user == {
+        "api_base": "https://api.openai.com/v1",
+        "reasoning_effort": "low",
+    }
+    assert config.max_concurrency == 4
+    assert config.seed == 300
+    assert config.verbose_logs is True
+    assert config.save_to == str((tmp_path / "0165-0165" / "telecom").resolve())
+
+
+def test_generation_defaults_match_gpt_oss_benchmark():
+    module = _load_module()
+
+    args = module.parse_args([])
+
+    assert args.profile == "qwen3.5-4b"
+    assert args.user_model == "gpt-5.2-2025-12-11"
+    assert args.temperature == 1.0
+    assert args.max_tokens == 4096
+    assert args.max_concurrency == 4
+    assert args.seed == 300

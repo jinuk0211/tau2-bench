@@ -34,9 +34,19 @@ is run in direct solo mode and does not require that endpoint.
 
 ## Linux/Vast.ai: progress-friendly airline and retail runs
 
-The Linux runner prints the active phase plus elapsed time, GPU utilization,
-trace count, and completed-view count every 15 seconds. It prompts for the
-OpenAI user-simulator key without echoing it and never starts an HTTP server.
+The Linux runner deliberately separates benchmark generation from analysis.
+It first serves the agent with vLLM and runs normal tau2 using the same common
+settings as the GPT-OSS benchmark: `gpt-5.2-2025-12-11` user simulator,
+`temperature=1.0`, `max_tokens=4096`, seed 300, verbose logs, and
+`llm-log-mode=all`. It then stops vLLM, waits for GPU memory to be released,
+and teacher-forces the saved assistant responses through local Transformers
+for J-Lens analysis. This keeps the benchmark trajectory comparable instead
+of changing generation to a greedy 256-token local-HF path.
+
+The runner prints the active phase plus elapsed time, GPU utilization, result
+file count, saved LLM-log count, and completed-view count every 15 seconds. It
+prompts for the OpenAI user-simulator key without echoing it and never starts
+an HTTP server.
 
 Run the two-task boundary pilot first:
 
@@ -57,17 +67,18 @@ Then run all 50 airline and 114 retail tasks:
 bash scripts/setup_and_run_jlens.sh --full
 ```
 
-Trace paths are stable so re-running the same mode can auto-resume generation.
-Each analysis attempt uses a new result directory, preventing an old error
-manifest from being overwritten.
+Trajectory paths are stable so re-running the same mode can auto-resume
+generation. Each domain directory contains standard `results.json` plus every
+verbose agent-call log. Each analysis attempt uses a new result directory,
+preventing an old error manifest from being overwritten.
 
-The analyzer never reconstructs a prompt from log text. It uses the recorded
-`input_ids + generated_ids`, validates their hashes, and refuses to truncate a
-trace. By default it includes every token position, every fourth fitted lens
-layer, the last fitted layer, and the model's actual final layer. Use
-`--layer-stride 1` to include every fitted layer.
+The offline analyzer reconstructs the request from the structured messages
+and tool schemas in the verbose call log, appends the actual saved assistant
+response, and tokenizes it with the pinned model revision. The bundled Linux
+runner analyzes every saved agent call, every token position, and every fitted
+lens layer.
 
-## 1. Capture exact traces
+## 1. Direct local-HF capture (manual/Windows path)
 
 Install the J-Lens extra from the repository root:
 
@@ -102,22 +113,27 @@ teacher-forced pass during the benchmark.
 The trace path supports both `{task_id}` and `{simulation_id}` placeholders, so
 parallel trials do not append unrelated calls to the same file.
 
-### Select one range across all three domains
+### Select one vLLM range across all three domains
 
 `scripts/run_jlens_range.py` treats the task sets as one stable, one-based
 catalog in this order: airline, retail, telecom. It accepts a starting position
 and an exact count, including ranges that cross a domain boundary:
 
 ```bash
-uv run python scripts/run_jlens_range.py --start 45 --count 10 --profile qwen3-8b
+uv run python scripts/run_jlens_range.py \
+  --start 45 \
+  --count 10 \
+  --profile qwen3.5-4b \
+  --agent-api-base http://127.0.0.1:8000/v1 \
+  --trajectory-root data/jlens_trajectories
 ```
 
 Use `--list-only` to print the total/domain counts and exact selected task IDs
-without loading the model. Airline and retail use `jlens_hf_agent` with the
-configured user simulator; telecom automatically uses `jlens_direct_solo`.
-The user simulator defaults to `openai/qwen3:8b` at
-`http://127.0.0.1:11434/v1` and can be changed with `--user-model` and
-`--user-api-base`.
+without contacting the model. The command expects an already-running vLLM
+server and writes standard tau2 `results.json` and verbose LLM logs. Its
+defaults are GPT-OSS-compatible (`gpt-5.2-2025-12-11`, temperature 1.0,
+4096 output tokens, concurrency 4, seed 300); `setup_and_run_jlens.sh` manages
+the server lifecycle and offline replay automatically.
 
 ## 2. Inspect before allocating the model
 
