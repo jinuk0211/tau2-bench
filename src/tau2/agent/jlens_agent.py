@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any, Optional
 
@@ -11,7 +12,7 @@ from tau2.agent.jlens_backend import (
     InstrumentedHFBackend,
     InterventionConfig,
 )
-from tau2.agent.llm_agent import LLMAgentState, LLMSoloAgent
+from tau2.agent.llm_agent import LLMAgent, LLMAgentState, LLMSoloAgent
 from tau2.data_model.message import (
     AssistantMessage,
     Message,
@@ -41,10 +42,21 @@ _BACKEND_KEYS = {
 }
 
 
-def _path_for_task(value: Optional[str], task_id: str) -> Optional[Path]:
+def _path_for_run(
+    value: Optional[str], task_id: str, simulation_id: Optional[str]
+) -> Optional[Path]:
     if value is None:
         return None
-    return Path(value.format(task_id=task_id))
+
+    def safe_segment(item: str) -> str:
+        return re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", item).strip(" .") or "item"
+
+    return Path(
+        value.format(
+            task_id=safe_segment(task_id),
+            simulation_id=safe_segment(simulation_id or "unspecified"),
+        )
+    )
 
 
 def backend_config_from_agent_args(
@@ -52,6 +64,7 @@ def backend_config_from_agent_args(
     llm: str,
     llm_args: Optional[dict[str, Any]],
     task_id: str,
+    simulation_id: Optional[str] = None,
 ) -> HFBackendConfig:
     """Split backend/instrumentation arguments from HF generation arguments."""
     args = dict(llm_args or {})
@@ -67,8 +80,8 @@ def backend_config_from_agent_args(
         max_input_tokens=int(backend_args.get("hf_max_input_tokens", 16384)),
         selected_layers=tuple(backend_args.get("jlens_selected_layers", ())),
         concept_tokens=dict(backend_args.get("jlens_concept_tokens", {})),
-        telemetry_path=_path_for_task(
-            backend_args.get("jlens_telemetry_path"), task_id
+        telemetry_path=_path_for_run(
+            backend_args.get("jlens_telemetry_path"), task_id, simulation_id
         ),
         lens_path=(
             Path(backend_args["jlens_path"]) if backend_args.get("jlens_path") else None
@@ -83,6 +96,69 @@ def backend_config_from_agent_args(
     )
 
 
+class JLensAgent(LLMAgent):
+    """Regular tau2 text agent using the exact-token local J-Lens backend."""
+
+    def __init__(
+        self,
+        tools: list[Tool],
+        domain_policy: str,
+        task: Task,
+        llm: str,
+        llm_args: Optional[dict] = None,
+        *,
+        simulation_id: Optional[str] = None,
+        backend: Optional[InstrumentedHFBackend] = None,
+    ):
+        super().__init__(
+            tools=tools,
+            domain_policy=domain_policy,
+            llm=llm,
+            llm_args=llm_args,
+        )
+        self.task = task
+        self.backend = backend or InstrumentedHFBackend.from_pretrained(
+            backend_config_from_agent_args(
+                llm=llm,
+                llm_args=llm_args,
+                task_id=str(task.id),
+                simulation_id=simulation_id,
+            )
+        )
+        self._turn_index = 0
+
+    def generate_next_message(
+        self,
+        message: UserMessage | ToolMessage | MultiToolMessage,
+        state: LLMAgentState,
+    ) -> tuple[AssistantMessage, LLMAgentState]:
+        """Respond normally while recording the exact rendered token stream."""
+        if isinstance(message, UserMessage) and message.is_audio:
+            raise ValueError("User message cannot be audio in JLensAgent")
+        boundaries: list[str] = []
+        if self._turn_index == 0:
+            boundaries.append("initial_decision")
+        if isinstance(message, MultiToolMessage):
+            state.messages.extend(message.tool_messages)
+            boundaries.append("after_tool_result")
+        else:
+            state.messages.append(message)
+            if isinstance(message, ToolMessage):
+                boundaries.append("after_tool_result")
+            elif isinstance(message, UserMessage):
+                boundaries.append("after_user_message")
+        generation = self.backend.generate(
+            messages=state.system_messages + state.messages,
+            tools=self.tools,
+            task_id=str(self.task.id),
+            turn_index=self._turn_index,
+            boundaries=boundaries,
+        )
+        state.messages.append(generation.message)
+        self._turn_index += 1
+        return generation.message, state
+
+
 class JLensSoloAgent(LLMSoloAgent):
     """No-user τ² agent using one shared local HF/J-Lens backend."""
 
@@ -94,6 +170,7 @@ class JLensSoloAgent(LLMSoloAgent):
         llm: str,
         llm_args: Optional[dict] = None,
         *,
+        simulation_id: Optional[str] = None,
         backend: Optional[InstrumentedHFBackend] = None,
     ):
         super().__init__(
@@ -105,7 +182,10 @@ class JLensSoloAgent(LLMSoloAgent):
         )
         self.backend = backend or InstrumentedHFBackend.from_pretrained(
             backend_config_from_agent_args(
-                llm=llm, llm_args=llm_args, task_id=str(task.id)
+                llm=llm,
+                llm_args=llm_args,
+                task_id=str(task.id),
+                simulation_id=simulation_id,
             )
         )
         self._turn_index = 0
@@ -168,4 +248,17 @@ def create_jlens_direct_solo_agent(tools, domain_policy, **kwargs):
         llm=kwargs.get("llm"),
         llm_args=kwargs.get("llm_args"),
         task=kwargs.get("task"),
+        simulation_id=kwargs.get("simulation_id"),
+    )
+
+
+def create_jlens_agent(tools, domain_policy, **kwargs):
+    """Factory for regular user-agent tau2 conversations with J-Lens traces."""
+    return JLensAgent(
+        tools=tools,
+        domain_policy=domain_policy,
+        llm=kwargs.get("llm"),
+        llm_args=kwargs.get("llm_args"),
+        task=kwargs.get("task"),
+        simulation_id=kwargs.get("simulation_id"),
     )

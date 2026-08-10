@@ -199,6 +199,57 @@ def _parsed_call_from_payload(
     )
 
 
+def _parsed_call_from_xml_payload(
+    payload: str, absolute_start: int
+) -> Optional[ParsedToolCall]:
+    """Parse the native Qwen3.5/3.6 function-and-parameter tool syntax."""
+    function = re.search(
+        r"<function=([^>\r\n]+)>\s*(.*?)\s*</function>",
+        payload,
+        re.DOTALL,
+    )
+    if function is None:
+        return None
+    name = function.group(1).strip()
+    if not name:
+        return None
+    arguments: dict[str, Any] = {}
+    value_spans: list[tuple[int, int]] = []
+    parameter_pattern = re.compile(
+        r"<parameter=([^>\r\n]+)>\s*(.*?)\s*</parameter>",
+        re.DOTALL,
+    )
+    for parameter in parameter_pattern.finditer(function.group(2)):
+        key = parameter.group(1).strip()
+        raw_value = parameter.group(2).strip()
+        if not key:
+            continue
+        try:
+            value = json.loads(raw_value)
+        except json.JSONDecodeError:
+            value = raw_value
+        arguments[key] = value
+        value_start = (
+            absolute_start
+            + function.start(2)
+            + parameter.start(2)
+            + len(parameter.group(2))
+            - len(parameter.group(2).lstrip())
+        )
+        value_spans.append((value_start, value_start + len(raw_value)))
+    name_offset = len(function.group(1)) - len(function.group(1).lstrip())
+    name_start = absolute_start + function.start(1) + name_offset
+    arguments_span = None
+    if value_spans:
+        arguments_span = (value_spans[0][0], value_spans[-1][1])
+    return ParsedToolCall(
+        name=name,
+        arguments=arguments,
+        name_span=(name_start, name_start + len(name)),
+        arguments_span=arguments_span,
+    )
+
+
 def parse_qwen_tool_calls(text: str) -> list[ParsedToolCall]:
     """Parse Qwen-style ``<tool_call>{...}</tool_call>`` output.
 
@@ -210,6 +261,8 @@ def parse_qwen_tool_calls(text: str) -> list[ParsedToolCall]:
     for match in pattern.finditer(text):
         payload = match.group(1)
         call = _parsed_call_from_payload(payload, match.start(1))
+        if call is None:
+            call = _parsed_call_from_xml_payload(payload, match.start(1))
         if call is not None:
             parsed.append(call)
     if parsed:
@@ -516,6 +569,40 @@ def _find_span_token_indices(
     return indices
 
 
+def semantic_prediction_positions(
+    tokenizer: Any,
+    prompt_length: int,
+    generated_ids: Sequence[int],
+    parsed_calls: Sequence[ParsedToolCall],
+) -> dict[str, list[int]]:
+    """Map tool-call character spans to exact next-token prediction positions.
+
+    A position is the token whose residual predicts the following token.  The
+    mapping is recorded even in ``off`` mode so the offline all-position
+    analyzer can add semantic overlays without rerendering or retokenizing the
+    conversation.
+    """
+    groups: dict[str, list[int]] = {}
+    if prompt_length:
+        groups["initial_decision"] = [prompt_length - 1]
+    for index, call in enumerate(parsed_calls):
+        name_tokens = _find_span_token_indices(
+            tokenizer, generated_ids, call.name_span
+        )
+        argument_tokens = _find_span_token_indices(
+            tokenizer, generated_ids, call.arguments_span
+        )
+        if name_tokens:
+            groups[f"tool_{index}_name"] = [
+                prompt_length + token_index - 1 for token_index in name_tokens
+            ]
+        if argument_tokens:
+            groups[f"tool_{index}_arguments"] = [
+                prompt_length + token_index - 1 for token_index in argument_tokens
+            ]
+    return groups
+
+
 def _mean(values: Sequence[float]) -> Optional[float]:
     return sum(values) / len(values) if values else None
 
@@ -730,38 +817,23 @@ class InstrumentedHFBackend:
         *,
         prompt_ids: Any,
         generated_ids: list[int],
-        parsed_calls: Sequence[ParsedToolCall],
+        position_groups: dict[str, list[int]],
     ) -> dict[str, Any]:
         import torch
         from jlens.hooks import ActivationRecorder
 
         if not generated_ids:
-            return {"positions": {}, "residuals": [], "motorization": {}}
+            return {
+                "positions": position_groups,
+                "residuals": [],
+                "motorization": {},
+            }
         generated = torch.tensor(
             [generated_ids], device=prompt_ids.device, dtype=prompt_ids.dtype
         )
         full_ids = torch.cat([prompt_ids, generated], dim=1)
-        prompt_length = int(prompt_ids.shape[1])
         final_layer = self.bundle.lens_model.n_layers - 1
         layers = tuple(sorted(set(self._selected_layers()) | {final_layer}))
-        position_groups: dict[str, list[int]] = {
-            "initial_decision": [prompt_length - 1]
-        }
-        for index, call in enumerate(parsed_calls):
-            name_tokens = _find_span_token_indices(
-                self.bundle.tokenizer, generated_ids, call.name_span
-            )
-            argument_tokens = _find_span_token_indices(
-                self.bundle.tokenizer, generated_ids, call.arguments_span
-            )
-            if name_tokens:
-                position_groups[f"tool_{index}_name"] = [
-                    prompt_length + token_index - 1 for token_index in name_tokens
-                ]
-            if argument_tokens:
-                position_groups[f"tool_{index}_arguments"] = [
-                    prompt_length + token_index - 1 for token_index in argument_tokens
-                ]
 
         with (
             torch.no_grad(),
@@ -903,6 +975,13 @@ class InstrumentedHFBackend:
         if any(call.name == stop_tool_name for call in parsed_calls):
             observed_boundaries.append("candidate_stop")
 
+        position_groups = semantic_prediction_positions(
+            self.bundle.tokenizer,
+            len(prompt_ids),
+            completion,
+            parsed_calls,
+        )
+
         measurement: dict[str, Any] = {}
         if self.config.mode in {
             InstrumentationMode.OBSERVE,
@@ -911,10 +990,11 @@ class InstrumentedHFBackend:
             measurement = self._teacher_forced_measurement(
                 prompt_ids=input_ids,
                 generated_ids=completion,
-                parsed_calls=parsed_calls,
+                position_groups=position_groups,
             )
+        full_ids_hash = token_ids_sha256([*prompt_ids, *completion])
         record = {
-            "schema_version": "tau2-jlens-v1",
+            "schema_version": "tau2-jlens-v2",
             "timestamp": _utc_now(),
             "task_id": task_id,
             "turn_index": turn_index,
@@ -940,11 +1020,20 @@ class InstrumentedHFBackend:
             "input_ids_sha256": token_ids_sha256(prompt_ids),
             "generated_ids": completion,
             "generated_ids_sha256": token_ids_sha256(completion),
+            "full_ids_sha256": full_ids_hash,
+            "prompt_tokens": len(prompt_ids),
+            "completion_tokens": len(completion),
             "generated_text": raw_text,
             "tool_calls": [
-                {"name": call.name, "arguments": call.arguments}
+                {
+                    "name": call.name,
+                    "arguments": call.arguments,
+                    "name_span": call.name_span,
+                    "arguments_span": call.arguments_span,
+                }
                 for call in parsed_calls
             ],
+            "semantic_positions": position_groups,
             "measurement": measurement,
         }
         record_id = hashlib.sha256(

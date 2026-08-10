@@ -1,8 +1,17 @@
 from copy import deepcopy
 
-from tau2.agent.jlens_agent import JLensSoloAgent
+from tau2.agent.jlens_agent import (
+    JLensAgent,
+    JLensSoloAgent,
+    backend_config_from_agent_args,
+)
 from tau2.agent.jlens_backend import BackendGeneration
-from tau2.data_model.message import AssistantMessage, ToolCall, ToolMessage
+from tau2.data_model.message import (
+    AssistantMessage,
+    ToolCall,
+    ToolMessage,
+    UserMessage,
+)
 from tau2.runner.build import build_user
 from tau2.user.user_simulator import DummyUser
 
@@ -114,3 +123,69 @@ def test_jlens_solo_returns_non_tool_output_for_orchestrator_classification(
     message, _ = agent.generate_next_message(None, agent.get_init_state())
     assert message.content == "invalid action"
     assert not message.is_tool_call()
+
+
+def test_regular_jlens_agent_records_user_and_tool_boundaries(
+    get_environment, base_task
+):
+    backend = FakeBackend()
+    environment = get_environment()
+    agent = JLensAgent(
+        llm="fake",
+        llm_args={},
+        tools=environment.get_tools(),
+        domain_policy=environment.get_policy(),
+        task=base_task,
+        backend=backend,
+    )
+    state = agent.get_init_state()
+    _, state = agent.generate_next_message(
+        UserMessage(role="user", content="Please create the task."), state
+    )
+    assert backend.calls[0]["boundaries"] == [
+        "initial_decision",
+        "after_user_message",
+    ]
+
+    result = ToolMessage(
+        id="stable",
+        role="tool",
+        content="created",
+        requestor="assistant",
+    )
+    agent.generate_next_message(result, state)
+    assert backend.calls[1]["boundaries"] == ["after_tool_result"]
+
+
+def test_telemetry_path_expands_task_and_simulation_ids():
+    config = backend_config_from_agent_args(
+        llm="fake",
+        task_id="task-7",
+        simulation_id="sim-9",
+        llm_args={
+            "jlens_telemetry_path": (
+                "data/traces/{task_id}/{simulation_id}/trace.jsonl"
+            )
+        },
+    )
+
+    assert config.telemetry_path.as_posix() == (
+        "data/traces/task-7/sim-9/trace.jsonl"
+    )
+
+
+def test_telemetry_path_sanitizes_windows_unsafe_task_ids():
+    config = backend_config_from_agent_args(
+        llm="fake",
+        task_id="[PERSONA:Hard]/roaming",
+        simulation_id="sim:9",
+        llm_args={
+            "jlens_telemetry_path": (
+                "data/traces/{task_id}/{simulation_id}.jsonl"
+            )
+        },
+    )
+
+    assert config.telemetry_path.as_posix() == (
+        "data/traces/[PERSONA_Hard]_roaming/sim_9.jsonl"
+    )

@@ -15,6 +15,7 @@ from tau2.agent.jlens_backend import (
     messages_for_hf,
     normalized_j_vector,
     parse_qwen_tool_calls,
+    semantic_prediction_positions,
     token_ids_sha256,
 )
 from tau2.data_model.message import AssistantMessage, SystemMessage, ToolCall
@@ -32,6 +33,30 @@ def test_parse_qwen_tool_call_and_motorization_spans():
     assert calls[0].arguments["enabled"] is True
     assert text[slice(*calls[0].name_span)] == '"set_roaming"'
     assert json.loads(text[slice(*calls[0].arguments_span)])["enabled"] is True
+
+
+def test_parse_qwen36_native_xml_tool_call_and_spans():
+    text = """<tool_call>
+<function=set_roaming>
+<parameter=phone_number>
++12025550123
+</parameter>
+<parameter=enabled>
+true
+</parameter>
+</function>
+</tool_call>"""
+
+    calls = parse_qwen_tool_calls(text)
+
+    assert len(calls) == 1
+    assert calls[0].name == "set_roaming"
+    assert calls[0].arguments == {
+        "phone_number": "+12025550123",
+        "enabled": True,
+    }
+    assert text[slice(*calls[0].name_span)] == "set_roaming"
+    assert "+12025550123" in text[slice(*calls[0].arguments_span)]
 
 
 def test_local_generation_conversion_uses_stable_tool_ids():
@@ -68,6 +93,27 @@ def test_hf_message_conversion_preserves_tool_structure():
 def test_exact_input_id_hash_is_order_sensitive():
     assert token_ids_sha256([1, 2, 3]) == token_ids_sha256([1, 2, 3])
     assert token_ids_sha256([1, 2, 3]) != token_ids_sha256([3, 2, 1])
+
+
+def test_semantic_prediction_positions_cover_every_tool_span_token():
+    text = '<tool_call>{"name":"done","arguments":{"ok":true}}</tool_call>'
+    calls = parse_qwen_tool_calls(text)
+
+    class CharacterTokenizer:
+        @staticmethod
+        def decode(token_ids, skip_special_tokens=False):
+            return "".join(chr(token_id) for token_id in token_ids)
+
+    positions = semantic_prediction_positions(
+        CharacterTokenizer(),
+        prompt_length=3,
+        generated_ids=[ord(character) for character in text],
+        parsed_calls=calls,
+    )
+
+    assert positions["initial_decision"] == [2]
+    assert len(positions["tool_0_name"]) == len('"done"')
+    assert len(positions["tool_0_arguments"]) == len('{"ok":true}')
 
 
 def test_jsonl_writer_appends_complete_records(tmp_path):
@@ -214,6 +260,11 @@ def test_observe_mode_preserves_exact_deterministic_generation(tmp_path):
     assert off.prompt_input_ids == observe.prompt_input_ids
     assert off.generated_ids == observe.generated_ids
     assert off.message.tool_calls == observe.message.tool_calls
+    assert observe.telemetry_record["schema_version"] == "tau2-jlens-v2"
+    assert observe.telemetry_record["semantic_positions"]["initial_decision"] == [2]
+    assert observe.telemetry_record["full_ids_sha256"] == token_ids_sha256(
+        [*observe.prompt_input_ids, *observe.generated_ids]
+    )
     assert observe.telemetry_record["measurement"]["residuals"]
 
 

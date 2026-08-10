@@ -16,6 +16,8 @@ data/models/
 data/analyses/
 data/annotations/
 data/jlens_smoke/
+data/jlens_traces/
+data/jlens_analysis/
 src/experiments/model_serving/vllm_serving/.*
 .ruff_cache
 
