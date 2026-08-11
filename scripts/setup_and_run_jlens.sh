@@ -318,6 +318,18 @@ run_step \
   "${SETUP_LOG}" \
   uv sync --python 3.12 --extra jlens --extra dev
 
+ANALYZER_HELP="$(
+  uv run --no-sync python "${JACOBIAN_DIR}/scripts/analyze_tau2.py" --help
+)"
+for required_option in --top-k --position-chunk-size --max-tracked; do
+  if [[ "${ANALYZER_HELP}" != *"${required_option}"* ]]; then
+    echo "ERROR: ${JACOBIAN_DIR}/scripts/analyze_tau2.py is missing ${required_option}." >&2
+    echo "Update visual-jlens/agent/full-trajectory-viewer before generation." >&2
+    exit 1
+  fi
+done
+echo "Jacobian Lens analyzer compatibility check passed."
+
 mapfile -t PROFILE_CONFIG < <(
   uv run --no-sync python - "${PROFILE}" <<'PY'
 import sys
@@ -503,7 +515,7 @@ inspect_trajectories() {
       --lens-file "${LENS_FILE}" \
       --include-successes \
       --call-selection all \
-      --inspect-only
+      --inspect-only || return $?
   done
   (( found == 1 ))
 }
@@ -552,7 +564,7 @@ analyze_trajectories() {
       --last-n-tokens 0 \
       --position-chunk-size 32 \
       --max-tracked 128 \
-      --max-seq-len 32768
+      --max-seq-len 32768 || return $?
   done
   (( found == 1 ))
 }
