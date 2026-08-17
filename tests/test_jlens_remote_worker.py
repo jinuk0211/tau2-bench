@@ -1,0 +1,76 @@
+import importlib.util
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+
+from fastapi.testclient import TestClient
+
+
+def _load_script():
+    path = Path(__file__).parents[1] / "scripts" / "jlens_remote_worker.py"
+    spec = importlib.util.spec_from_file_location("jlens_remote_worker", path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_worker_preflight_checks_cuda_remote_hf_and_artifacts(tmp_path):
+    script = _load_script()
+    artifact = tmp_path / "caa.pt"
+    artifact.write_bytes(b"artifact")
+
+    ready = script.worker_preflight_report(
+        [str(artifact)],
+        {"HF_TOKEN": "secret"},
+        cuda_available=True,
+        cuda_device_count=1,
+        loaded_backends=0,
+    )
+    assert ready["status"] == "ok"
+    assert ready["huggingface_token_present"]
+    assert ready["missing_artifacts"] == []
+
+    missing = script.worker_preflight_report(
+        [str(tmp_path / "missing.pt")],
+        {},
+        cuda_available=True,
+        cuda_device_count=1,
+        loaded_backends=0,
+    )
+    assert missing["status"] == "not_ready"
+    assert len(missing["missing_artifacts"]) == 1
+
+
+def test_remote_preflight_endpoint_is_authenticated_and_does_not_load_model(
+    tmp_path, monkeypatch
+):
+    script = _load_script()
+    artifact = tmp_path / "artifact.pt"
+    artifact.write_bytes(b"artifact")
+    monkeypatch.setitem(
+        sys.modules,
+        "torch",
+        SimpleNamespace(
+            cuda=SimpleNamespace(
+                is_available=lambda: True,
+                device_count=lambda: 1,
+            )
+        ),
+    )
+    client = TestClient(script.create_app(token="worker-secret"))
+
+    unauthorized = client.post(
+        "/v1/preflight",
+        json={"artifact_paths": [str(artifact)]},
+    )
+    assert unauthorized.status_code == 401
+
+    response = client.post(
+        "/v1/preflight",
+        headers={"Authorization": "Bearer worker-secret"},
+        json={"artifact_paths": [str(artifact)]},
+    )
+    assert response.status_code == 200
+    assert response.json()["status"] == "ok"
+    assert response.json()["loaded_backends"] == 0
