@@ -326,6 +326,28 @@ class HFBackendConfig:
             raise ValueError(f"unknown SDPA backend: {self.sdpa_backend}")
 
 
+def _generation_kwargs_for_tokenizer(
+    config: HFBackendConfig, tokenizer: Any
+) -> dict[str, Any]:
+    """Resolve generation defaults from the tokenizer's actual chat tokens."""
+    generation_kwargs = dict(config.generation_kwargs)
+    generation_kwargs.setdefault("max_new_tokens", 256)
+    generation_kwargs.setdefault("do_sample", False)
+    tokenizer_eos_token_id = tokenizer.eos_token_id
+    if tokenizer_eos_token_id is not None:
+        # Some multimodal model configs (including Qwen3.5) expose a text
+        # config EOS that differs from the chat template's <|im_end|>.
+        # Transformers otherwise generates until max_new_tokens instead of
+        # stopping at the tokenizer's actual assistant-turn boundary.
+        generation_kwargs.setdefault("eos_token_id", tokenizer_eos_token_id)
+    tokenizer_pad_token_id = tokenizer.pad_token_id
+    if tokenizer_pad_token_id is None:
+        tokenizer_pad_token_id = tokenizer_eos_token_id
+    if tokenizer_pad_token_id is not None:
+        generation_kwargs.setdefault("pad_token_id", tokenizer_pad_token_id)
+    return generation_kwargs
+
+
 @dataclass(frozen=True)
 class ParsedToolCall:
     """Parsed tool call plus character spans in the generated text."""
@@ -2845,13 +2867,9 @@ class InstrumentedHFBackend:
             rendering_metadata,
         ) = self._render(messages, tools)
         prompt_ids = input_ids.detach().cpu()[0].tolist()
-        generation_kwargs = dict(self.config.generation_kwargs)
-        generation_kwargs.setdefault("max_new_tokens", 256)
-        generation_kwargs.setdefault("do_sample", False)
-        if self.bundle.tokenizer.pad_token_id is None:
-            generation_kwargs.setdefault(
-                "pad_token_id", self.bundle.tokenizer.eos_token_id
-            )
+        generation_kwargs = _generation_kwargs_for_tokenizer(
+            self.config, self.bundle.tokenizer
+        )
         torch.manual_seed(self.config.seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(self.config.seed)

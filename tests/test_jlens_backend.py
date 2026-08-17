@@ -11,6 +11,7 @@ from tau2.agent.jlens_backend import (
     InterventionConfig,
     JSONLTelemetryWriter,
     _ModelBundle,
+    _generation_kwargs_for_tokenizer,
     assistant_message_from_generation,
     cast_condition_similarity,
     expanded_gqa_sdpa_forward,
@@ -1172,6 +1173,34 @@ def test_observe_mode_preserves_exact_deterministic_generation(tmp_path):
         [*observe.prompt_input_ids, *observe.generated_ids]
     )
     assert observe.telemetry_record["measurement"]["residuals"]
+
+
+def test_generation_uses_tokenizer_chat_eos_instead_of_model_config_eos():
+    tokenizer = SimpleNamespace(eos_token_id=248046, pad_token_id=248044)
+    config = HFBackendConfig(
+        model_name_or_path="Qwen/Qwen3.5-4B",
+        generation_kwargs={"max_new_tokens": 4096},
+    )
+
+    kwargs = _generation_kwargs_for_tokenizer(config, tokenizer)
+
+    assert kwargs["eos_token_id"] == 248046
+    assert kwargs["pad_token_id"] == 248044
+    assert kwargs["max_new_tokens"] == 4096
+    assert kwargs["do_sample"] is False
+
+
+def test_explicit_generation_stop_tokens_are_preserved():
+    tokenizer = SimpleNamespace(eos_token_id=248046, pad_token_id=None)
+    config = HFBackendConfig(
+        model_name_or_path="fake",
+        generation_kwargs={"eos_token_id": 7, "pad_token_id": 8},
+    )
+
+    kwargs = _generation_kwargs_for_tokenizer(config, tokenizer)
+
+    assert kwargs["eos_token_id"] == 7
+    assert kwargs["pad_token_id"] == 8
 
 
 def test_expanded_gqa_attention_matches_query_head_count():
