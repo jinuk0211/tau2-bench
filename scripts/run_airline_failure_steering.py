@@ -107,6 +107,9 @@ def build_run_command(
         str(matrix.get("generation", {}).get("seed", 300)),
         "--save-to",
         save_to,
+        "--verbose-logs",
+        "--llm-log-mode",
+        "all",
         "--auto-resume",
     ]
 

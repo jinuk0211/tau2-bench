@@ -62,6 +62,8 @@ def test_generic_runner_forces_remote_backend_and_official_full_review(monkeypat
         "2",
         "6",
     ]
+    assert "--verbose-logs" in command
+    assert command[command.index("--llm-log-mode") + 1] == "all"
 
     review = script.build_review_command(
         Path("results.json"), review_model="review/model"
