@@ -13,6 +13,11 @@ from typing import Any
 from tau2.agent.jlens_failure_protocol import load_failure_steering_matrix
 
 
+DEFAULT_USER_LLM = "gpt-5.2-2025-12-11"
+DEFAULT_USER_LLM_ARGS = '{"reasoning_effort":"low"}'
+DEFAULT_REVIEW_MODEL = "gpt-4.1-2025-04-14"
+
+
 def _load_matrix(path: Path) -> dict[str, Any]:
     return load_failure_steering_matrix(path)
 
@@ -217,11 +222,11 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--num-trials", type=int, default=1)
     parser.add_argument("--max-concurrency", type=int, default=1)
-    parser.add_argument("--user-llm", default="gpt-4.1-2025-04-14")
-    parser.add_argument("--user-llm-args", default='{"temperature":0.0,"seed":300}')
+    parser.add_argument("--user-llm", default=DEFAULT_USER_LLM)
+    parser.add_argument("--user-llm-args", default=DEFAULT_USER_LLM_ARGS)
     parser.add_argument("--save-prefix", default="failure-steering")
     parser.add_argument("--review", action="store_true")
-    parser.add_argument("--review-model", default="gpt-4.1-2025-04-14")
+    parser.add_argument("--review-model", default=DEFAULT_REVIEW_MODEL)
     parser.add_argument("--dry-run", action="store_true")
     return parser
 

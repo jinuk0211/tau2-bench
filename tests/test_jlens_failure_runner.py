@@ -155,3 +155,13 @@ def test_method_selection_runs_one_core_baseline_family_at_a_time():
             condition_name="baseline",
             method="caa",
         )
+
+
+def test_defaults_match_original_jlens_user_simulator():
+    script = _load_script()
+
+    args = script._parser().parse_args(["matrix.json"])
+
+    assert args.user_llm == "gpt-5.2-2025-12-11"
+    assert json.loads(args.user_llm_args) == {"reasoning_effort": "low"}
+    assert args.review_model == "gpt-4.1-2025-04-14"
