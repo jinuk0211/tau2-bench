@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import subprocess
 import sys
@@ -15,6 +16,7 @@ from tau2.agent.jlens_failure_protocol import load_failure_steering_matrix
 DEFAULT_USER_LLM = "gpt-5.2-2025-12-11"
 DEFAULT_USER_LLM_ARGS = '{"reasoning_effort":"low"}'
 DEFAULT_REVIEW_MODEL = "gpt-4.1-2025-04-14"
+DEFAULT_SIMULATION_TIMEOUT_SECONDS = 1200.0
 
 
 def _load_matrix(path: Path) -> dict[str, Any]:
@@ -63,8 +65,14 @@ def build_run_command(
     telemetry_path: Path,
     num_trials: int,
     max_concurrency: int,
+    simulation_timeout_seconds: float = DEFAULT_SIMULATION_TIMEOUT_SECONDS,
     allow_missing_endpoint: bool = False,
 ) -> list[str]:
+    if (
+        not math.isfinite(simulation_timeout_seconds)
+        or simulation_timeout_seconds <= 0
+    ):
+        raise ValueError("simulation timeout must be a finite positive number")
     agent_args = _condition_args(
         matrix,
         condition,
@@ -100,6 +108,8 @@ def build_run_command(
         json.dumps(user_llm_args, ensure_ascii=False, separators=(",", ":")),
         "--max-steps",
         "200",
+        "--timeout",
+        f"{simulation_timeout_seconds:g}",
         "--max-concurrency",
         str(max_concurrency),
         "--seed",
@@ -223,6 +233,12 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--num-trials", type=int, default=1)
     parser.add_argument("--max-concurrency", type=int, default=1)
+    parser.add_argument(
+        "--simulation-timeout-seconds",
+        type=float,
+        default=DEFAULT_SIMULATION_TIMEOUT_SECONDS,
+        help="Maximum wallclock seconds for each simulation (default: 1200).",
+    )
     parser.add_argument("--user-llm", default=DEFAULT_USER_LLM)
     parser.add_argument("--user-llm-args", default=DEFAULT_USER_LLM_ARGS)
     parser.add_argument("--save-prefix", default="failure-steering")
@@ -266,6 +282,7 @@ def main() -> int:
             telemetry_path=telemetry,
             num_trials=args.num_trials,
             max_concurrency=args.max_concurrency,
+            simulation_timeout_seconds=args.simulation_timeout_seconds,
             allow_missing_endpoint=args.dry_run,
         )
         print(
