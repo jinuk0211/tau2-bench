@@ -17,6 +17,7 @@ DEFAULT_USER_LLM = "gpt-5.2-2025-12-11"
 DEFAULT_USER_LLM_ARGS = '{"reasoning_effort":"low"}'
 DEFAULT_REVIEW_MODEL = "gpt-4.1-2025-04-14"
 DEFAULT_SIMULATION_TIMEOUT_SECONDS = 1200.0
+DEFAULT_MAX_RETRIES = 1
 
 
 def _load_matrix(path: Path) -> dict[str, Any]:
@@ -66,6 +67,7 @@ def build_run_command(
     num_trials: int,
     max_concurrency: int,
     simulation_timeout_seconds: float = DEFAULT_SIMULATION_TIMEOUT_SECONDS,
+    max_retries: int = DEFAULT_MAX_RETRIES,
     allow_missing_endpoint: bool = False,
 ) -> list[str]:
     if (
@@ -73,6 +75,12 @@ def build_run_command(
         or simulation_timeout_seconds <= 0
     ):
         raise ValueError("simulation timeout must be a finite positive number")
+    if (
+        isinstance(max_retries, bool)
+        or not isinstance(max_retries, int)
+        or max_retries < 0
+    ):
+        raise ValueError("max retries must be a nonnegative integer")
     agent_args = _condition_args(
         matrix,
         condition,
@@ -110,6 +118,8 @@ def build_run_command(
         "200",
         "--timeout",
         f"{simulation_timeout_seconds:g}",
+        "--max-retries",
+        str(max_retries),
         "--max-concurrency",
         str(max_concurrency),
         "--seed",
@@ -239,6 +249,12 @@ def _parser() -> argparse.ArgumentParser:
         default=DEFAULT_SIMULATION_TIMEOUT_SECONDS,
         help="Maximum wallclock seconds for each simulation (default: 1200).",
     )
+    parser.add_argument(
+        "--max-retries",
+        type=int,
+        default=DEFAULT_MAX_RETRIES,
+        help="Retries after an infrastructure failure (default: 1).",
+    )
     parser.add_argument("--user-llm", default=DEFAULT_USER_LLM)
     parser.add_argument("--user-llm-args", default=DEFAULT_USER_LLM_ARGS)
     parser.add_argument("--save-prefix", default="failure-steering")
@@ -283,6 +299,7 @@ def main() -> int:
             num_trials=args.num_trials,
             max_concurrency=args.max_concurrency,
             simulation_timeout_seconds=args.simulation_timeout_seconds,
+            max_retries=args.max_retries,
             allow_missing_endpoint=args.dry_run,
         )
         print(

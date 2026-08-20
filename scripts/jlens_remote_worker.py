@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import secrets
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +19,26 @@ from tau2.agent.jlens_remote_backend import (
     execute_remote_payload,
     hf_config_from_wire,
 )
+
+LOGGER = logging.getLogger("uvicorn.error")
+GENERATION_HEARTBEAT_SECONDS = 30.0
+
+
+def _log_generation_heartbeat(
+    stop_event: threading.Event,
+    *,
+    task_id: str,
+    turn_index: int,
+    started_at: float,
+    interval_seconds: float = GENERATION_HEARTBEAT_SECONDS,
+) -> None:
+    while not stop_event.wait(interval_seconds):
+        LOGGER.info(
+            "Qwen generation running task=%s turn=%s elapsed=%.1fs",
+            task_id,
+            turn_index,
+            time.perf_counter() - started_at,
+        )
 
 
 def worker_preflight_report(
@@ -105,7 +127,50 @@ def create_app(*, token: str) -> FastAPI:
             # Hooks mutate shared module registration state. Serialize generations
             # until the backend gains a process-per-GPU scheduler.
             with generation_lock:
-                return execute_remote_payload(payload, backend_loader=load_backend)
+                task_id = str(payload.get("task_id", "unknown"))
+                turn_index = int(payload.get("turn_index", -1))
+                started_at = time.perf_counter()
+                stop_heartbeat = threading.Event()
+                heartbeat = threading.Thread(
+                    target=_log_generation_heartbeat,
+                    kwargs={
+                        "stop_event": stop_heartbeat,
+                        "task_id": task_id,
+                        "turn_index": turn_index,
+                        "started_at": started_at,
+                    },
+                    name=f"jlens-heartbeat-{task_id}-{turn_index}",
+                    daemon=True,
+                )
+                LOGGER.info(
+                    "Qwen generation started task=%s turn=%s",
+                    task_id,
+                    turn_index,
+                )
+                heartbeat.start()
+                try:
+                    response = execute_remote_payload(
+                        payload, backend_loader=load_backend
+                    )
+                except Exception:
+                    LOGGER.exception(
+                        "Qwen generation failed task=%s turn=%s elapsed=%.1fs",
+                        task_id,
+                        turn_index,
+                        time.perf_counter() - started_at,
+                    )
+                    raise
+                finally:
+                    stop_heartbeat.set()
+                    heartbeat.join(timeout=1.0)
+                LOGGER.info(
+                    "Qwen generation completed task=%s turn=%s elapsed=%.1fs tokens=%s",
+                    task_id,
+                    turn_index,
+                    time.perf_counter() - started_at,
+                    len(response.get("generated_ids") or []),
+                )
+                return response
         except (KeyError, TypeError, ValueError) as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
 

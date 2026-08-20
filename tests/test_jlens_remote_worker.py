@@ -74,3 +74,33 @@ def test_remote_preflight_endpoint_is_authenticated_and_does_not_load_model(
     assert response.status_code == 200
     assert response.json()["status"] == "ok"
     assert response.json()["loaded_backends"] == 0
+
+
+def test_generation_heartbeat_reports_task_turn_and_elapsed(monkeypatch):
+    script = _load_script()
+    messages = []
+
+    class StopAfterOneHeartbeat:
+        calls = 0
+
+        def wait(self, _interval):
+            self.calls += 1
+            return self.calls > 1
+
+    monkeypatch.setattr(
+        script.LOGGER,
+        "info",
+        lambda message, *args: messages.append(message % args),
+    )
+    script._log_generation_heartbeat(
+        StopAfterOneHeartbeat(),
+        task_id="33",
+        turn_index=4,
+        started_at=script.time.perf_counter() - 5,
+        interval_seconds=0,
+    )
+
+    assert len(messages) == 1
+    assert "task=33" in messages[0]
+    assert "turn=4" in messages[0]
+    assert "elapsed=" in messages[0]

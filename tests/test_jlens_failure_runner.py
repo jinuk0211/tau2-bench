@@ -65,6 +65,7 @@ def test_generic_runner_forces_remote_backend_and_official_full_review(monkeypat
     assert "--verbose-logs" in command
     assert command[command.index("--llm-log-mode") + 1] == "all"
     assert command[command.index("--timeout") + 1] == "1200"
+    assert command[command.index("--max-retries") + 1] == "1"
 
     review = script.build_review_command(
         Path("results.json"), review_model="review/model"
@@ -169,6 +170,7 @@ def test_defaults_match_original_jlens_user_simulator():
     assert json.loads(args.user_llm_args) == {"reasoning_effort": "low"}
     assert args.review_model == "gpt-4.1-2025-04-14"
     assert args.simulation_timeout_seconds == 1200.0
+    assert args.max_retries == 1
 
 
 def test_generic_runner_rejects_nonpositive_simulation_timeout(monkeypatch):
@@ -195,4 +197,31 @@ def test_generic_runner_rejects_nonpositive_simulation_timeout(monkeypatch):
             num_trials=1,
             max_concurrency=1,
             simulation_timeout_seconds=0,
+        )
+
+
+def test_generic_runner_rejects_negative_max_retries(monkeypatch):
+    script = _load_script()
+    monkeypatch.setenv("JLENS_ENDPOINT", "https://gpu.example")
+    matrix = {
+        "model": {"model_id": "org/model"},
+        "execution": {
+            "endpoint_env": "JLENS_ENDPOINT",
+            "token_env": "JLENS_TOKEN",
+        },
+    }
+
+    with pytest.raises(ValueError, match="nonnegative integer"):
+        script.build_run_command(
+            matrix,
+            {"name": "baseline", "agent_llm_args": {}},
+            split="train",
+            task_ids=["0"],
+            user_llm="review/user",
+            user_llm_args={},
+            save_to="failure/train/baseline",
+            telemetry_path=Path("trace-{task_id}.jsonl"),
+            num_trials=1,
+            max_concurrency=1,
+            max_retries=-1,
         )
