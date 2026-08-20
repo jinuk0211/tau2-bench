@@ -10,8 +10,8 @@ from tau2.agent.jlens_backend import (
     InstrumentedHFBackend,
     InterventionConfig,
     JSONLTelemetryWriter,
-    _ModelBundle,
     _generation_kwargs_for_tokenizer,
+    _ModelBundle,
     assistant_message_from_generation,
     cast_condition_similarity,
     expanded_gqa_sdpa_forward,
@@ -20,7 +20,6 @@ from tau2.agent.jlens_backend import (
     load_caa_direction_artifact,
     load_cast_artifact,
     load_iti_artifact,
-    load_loreft_artifact,
     load_mera_artifact,
     load_sadi_artifact,
     mera_closed_form_delta,
@@ -303,52 +302,6 @@ def _write_austeer_artifact(torch, path, *, model_id="fake"):
         "selected_units": units,
         "selected_betas": betas,
         "validation_betas": validation,
-    }
-    artifact = {
-        **metadata,
-        "metadata_fingerprint": hashlib.sha256(
-            json.dumps(metadata, sort_keys=True, separators=(",", ":")).encode()
-        ).hexdigest(),
-        **{
-            f"{name}_fingerprint": hashlib.sha256(
-                tensor.contiguous().float().numpy().tobytes()
-            ).hexdigest()
-            for name, tensor in tensors.items()
-        },
-        **tensors,
-    }
-    torch.save(artifact, path)
-    return artifact
-
-
-def _write_loreft_artifact(torch, path, *, model_id="fake"):
-    rotations = torch.tensor([[[1.0], [0.0], [0.0], [0.0]]])
-    weights = torch.tensor([[[0.0, 1.0, 0.0, 0.0]]])
-    biases = torch.tensor([[0.5]])
-    metadata = {
-        "schema_version": "agent-loreft-v1",
-        "method": "loreft",
-        "model_id": model_id,
-        "model_revision": "revision",
-        "layers": [0],
-        "d_model": 4,
-        "rank": 1,
-        "train_example_ids": ["t0"],
-        "train_example_count": 1,
-        "validation_example_ids": ["v0"],
-        "validation_example_count": 1,
-        "formula": "h_plus_learned_source_minus_projection_times_rotation_transpose",
-        "benchmark": "taubench-airline-task18",
-        "training": {"optimizer": "adamw"},
-        "validation_loss": 1.0,
-        "site": "block_output",
-        "position": "last_prompt_token",
-        "source": {"repository": "stanfordnlp/pyreft", "revision": "abc"},
-    }
-    tensors = {
-        "rotations": rotations,
-        "learned_weights": weights,
-        "learned_biases": biases,
     }
     artifact = {
         **metadata,
@@ -903,53 +856,6 @@ def test_austeer_artifact_multiplies_all_attention_aus(tmp_path):
     torch.testing.assert_close(decode[0, -1], expected)
     assert trace["applied_prefill_scalars"] == 6
     assert trace["applied_decode_scalars"] == 2
-
-
-def test_loreft_artifact_changes_only_last_prompt_position(tmp_path):
-    torch = pytest.importorskip("torch")
-    path = tmp_path / "loreft.pt"
-    artifact = _write_loreft_artifact(torch, path)
-    loaded, metadata = load_loreft_artifact(path, model_id="fake", d_model=4)
-    torch.testing.assert_close(loaded["rotations"], artifact["rotations"])
-    assert metadata["rank"] == 1
-
-    class FakeLensModel:
-        n_layers = 1
-        d_model = 4
-        layers = torch.nn.ModuleList([torch.nn.Identity()])
-
-    bundle = _ModelBundle(
-        model=SimpleNamespace(),
-        tokenizer=SimpleNamespace(encode=lambda *_args, **_kwargs: []),
-        lens_model=FakeLensModel(),
-    )
-    backend = InstrumentedHFBackend(
-        HFBackendConfig(
-            model_name_or_path="fake",
-            mode=InstrumentationMode.INTERVENE,
-            intervention=InterventionConfig(
-                kind="steer",
-                method="loreft",
-                layer=0,
-                vector_path=path,
-                strength=1.0,
-                apply_decode=False,
-            ),
-        ),
-        bundle=bundle,
-    )
-    prompt_input = torch.tensor(
-        [[[1.0, 2.0, 0.0, 0.0], [3.0, 4.0, 0.0, 0.0]]]
-    )
-    with backend._intervention_hook(active=True, selection_reason="selected") as trace:
-        prompt = bundle.lens_model.layers[0](prompt_input)
-        decode = bundle.lens_model.layers[0](torch.ones(1, 1, 4))
-
-    torch.testing.assert_close(prompt[0, 0], prompt_input[0, 0])
-    torch.testing.assert_close(prompt[0, 1], torch.tensor([4.5, 4.0, 0.0, 0.0]))
-    torch.testing.assert_close(decode, torch.ones(1, 1, 4))
-    assert trace["applied_prefill_positions"] == 1
-    assert trace["applied_decode_positions"] == 0
 
 
 def test_caa_config_parses_exact_turn_and_boundary_gates(tmp_path):

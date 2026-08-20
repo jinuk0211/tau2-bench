@@ -1,4 +1,4 @@
-"""Validate remote credentials and the compiled Core-7 matrix without loading a model."""
+"""Validate remote credentials and the compiled baseline matrix without loading a model."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from typing import Any, Mapping
 
 from tau2.agent.jlens_failure_protocol import load_failure_steering_matrix
 
-CORE_METHODS = {"caa", "cast", "mera", "sadi", "iti", "austeer", "loreft"}
+SUPPORTED_METHODS = {"caa", "cast", "mera", "sadi", "iti", "austeer", "jservo"}
 REVIEW_KEY_ENVS = ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "OPENROUTER_API_KEY")
 
 
@@ -34,9 +34,14 @@ def preflight_report(
         for item in matrix.get("conditions") or []
         if item.get("method") != "none"
     }
+    selected_method_present = (
+        method in {"baseline", "all"} or method in methods
+    )
     checks = {
         "matrix_fingerprint_verified": True,
-        "all_core7_methods_present": CORE_METHODS.issubset(methods),
+        "matrix_methods_supported": bool(methods)
+        and methods.issubset(SUPPORTED_METHODS),
+        "selected_method_present": selected_method_present,
         "remote_endpoint_present": bool(environment.get(endpoint_env)),
         "remote_token_present": bool(environment.get(token_env)),
         "review_provider_key_present": any(
@@ -142,7 +147,6 @@ def main() -> int:
             "sadi",
             "iti",
             "austeer",
-            "loreft",
             "jservo",
             "all",
         ],

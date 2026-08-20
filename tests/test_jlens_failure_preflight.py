@@ -19,7 +19,10 @@ def test_preflight_reports_presence_without_secret_values():
             "endpoint_env": "JLENS_REMOTE_ENDPOINT",
             "token_env": "JLENS_REMOTE_TOKEN",
         },
-        "conditions": [{"method": method} for method in sorted(script.CORE_METHODS)],
+        "conditions": [
+            {"method": method}
+            for method in ["caa", "mera", "sadi", "iti", "austeer"]
+        ],
     }
     environment = {
         "JLENS_REMOTE_ENDPOINT": "https://secret-host.example",
@@ -75,6 +78,38 @@ def test_artifact_selection_is_method_scoped_and_baseline_is_empty():
     ]
 
 
+def test_five_baselines_plus_jservo_are_supported():
+    script = _load_script()
+    methods = ["caa", "mera", "sadi", "iti", "austeer", "jservo"]
+    matrix = {
+        "matrix_fingerprint": "fingerprint",
+        "execution": {
+            "endpoint_env": "JLENS_REMOTE_ENDPOINT",
+            "token_env": "JLENS_REMOTE_TOKEN",
+        },
+        "conditions": [{"method": method} for method in methods],
+    }
+
+    report = script.preflight_report(
+        matrix,
+        {
+            "JLENS_REMOTE_ENDPOINT": "http://127.0.0.1:8877",
+            "JLENS_REMOTE_TOKEN": "token",
+            "OPENAI_API_KEY": "review-key",
+        },
+        health={
+            "status": "ok",
+            "cuda_available": True,
+            "missing_artifacts": [],
+        },
+        method="caa",
+        require_hf_token=False,
+    )
+
+    assert report["ready"]
+    assert report["checks"]["matrix_methods_supported"]
+
+
 def test_skipped_remote_check_does_not_claim_artifacts_are_ready():
     script = _load_script()
     matrix = {
@@ -83,7 +118,10 @@ def test_skipped_remote_check_does_not_claim_artifacts_are_ready():
             "endpoint_env": "JLENS_REMOTE_ENDPOINT",
             "token_env": "JLENS_REMOTE_TOKEN",
         },
-        "conditions": [{"method": method} for method in sorted(script.CORE_METHODS)],
+        "conditions": [
+            {"method": method}
+            for method in ["caa", "mera", "sadi", "iti", "austeer"]
+        ],
     }
 
     report = script.preflight_report(

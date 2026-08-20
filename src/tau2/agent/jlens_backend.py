@@ -146,7 +146,6 @@ class InterventionConfig:
             "sadi",
             "iti",
             "austeer",
-            "loreft",
         }:
             raise ValueError("vector_path artifacts require a supported artifact method")
         if self.cast_prefill_mode not in {"all_tokens", "decision_only"}:
@@ -163,10 +162,6 @@ class InterventionConfig:
             raise ValueError("ITI currently supports kind='steer' only")
         if self.method == "austeer" and self.kind != "steer":
             raise ValueError("AUSteer currently supports kind='steer' only")
-        if self.method == "loreft" and self.vector_path is None:
-            raise ValueError("LoReFT requires a versioned artifact")
-        if self.method == "loreft" and self.kind != "steer":
-            raise ValueError("LoReFT currently supports kind='steer' only")
         if self.method == "sadi" and self.strength < 0.0:
             raise ValueError("SADI strength must be non-negative")
         if self.sadi_top_k is not None and self.sadi_top_k <= 0:
@@ -387,7 +382,6 @@ _MERA_ARTIFACT_SCHEMA = "agent-mera-v1"
 _SADI_ARTIFACT_SCHEMA = "agent-sadi-v1"
 _ITI_ARTIFACT_SCHEMA = "agent-iti-v1"
 _AUSTEER_ARTIFACT_SCHEMA = "agent-austeer-v1"
-_LOREFT_ARTIFACT_SCHEMA = "agent-loreft-v1"
 _STEERING_TENSOR_FIELDS = {
     "direction",
     "unit_direction",
@@ -1013,68 +1007,6 @@ def load_austeer_artifact(
     return artifact, source
 
 
-def load_loreft_artifact(
-    path: Path,
-    *,
-    model_id: str,
-    d_model: int,
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Load and identity-check a shared LoReFT checkpoint."""
-    import torch
-
-    artifact = torch.load(Path(path), map_location="cpu", weights_only=True)
-    if not isinstance(artifact, dict):
-        raise ValueError("LoReFT artifact must be a dictionary")
-    if artifact.get("schema_version") != _LOREFT_ARTIFACT_SCHEMA:
-        raise ValueError("unsupported LoReFT artifact schema")
-    if artifact.get("method") != "loreft" or artifact.get("model_id") != model_id:
-        raise ValueError("LoReFT artifact method or model does not match")
-    layers = [int(value) for value in artifact.get("layers", [])]
-    rank = int(artifact.get("rank", -1))
-    if int(artifact.get("d_model", -1)) != d_model or rank <= 0 or not layers:
-        raise ValueError("LoReFT artifact shape metadata does not match the model")
-    expected_shapes = {
-        "rotations": (len(layers), d_model, rank),
-        "learned_weights": (len(layers), rank, d_model),
-        "learned_biases": (len(layers), rank),
-    }
-    for name, shape in expected_shapes.items():
-        tensor = artifact.get(name)
-        if tensor is None or tuple(tensor.shape) != shape or not bool(torch.isfinite(tensor).all()):
-            raise ValueError(f"LoReFT {name} is missing, malformed, or non-finite")
-        if _tensor_sha256(tensor) != artifact.get(f"{name}_fingerprint"):
-            raise ValueError(f"LoReFT {name} fingerprint mismatch")
-    gram = artifact["rotations"].transpose(1, 2) @ artifact["rotations"]
-    identity = torch.eye(rank, dtype=torch.float32).expand_as(gram)
-    if not bool(torch.allclose(gram.float(), identity, atol=1e-4, rtol=1e-4)):
-        raise ValueError("LoReFT rotations are not orthonormal")
-    tensor_names = set(expected_shapes)
-    metadata = {
-        key: value
-        for key, value in artifact.items()
-        if key != "metadata_fingerprint"
-        and key not in tensor_names
-        and not key.endswith("_fingerprint")
-    }
-    fingerprint = hashlib.sha256(
-        json.dumps(metadata, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
-    if fingerprint != artifact.get("metadata_fingerprint"):
-        raise ValueError("LoReFT artifact metadata fingerprint mismatch")
-    source = {
-        "schema_version": artifact["schema_version"],
-        "method": artifact["method"],
-        "model_id": artifact["model_id"],
-        "model_revision": artifact.get("model_revision"),
-        "layers": layers,
-        "rank": rank,
-        "benchmark": artifact.get("benchmark"),
-        "validation_loss": float(artifact.get("validation_loss")),
-        "metadata_fingerprint": artifact["metadata_fingerprint"],
-    }
-    return artifact, source
-
-
 def mera_closed_form_delta(
     hidden_states: Any,
     probe_vector: Any,
@@ -1585,7 +1517,6 @@ class InstrumentedHFBackend:
         self._austeer_artifacts: dict[
             tuple[str, Optional[int]], tuple[dict[str, Any], dict[str, Any]]
         ] = {}
-        self._loreft_artifacts: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
         self._jservo_artifacts: dict[str, dict[str, Any]] = {}
 
     def _jservo_artifact(self, controller: JServoConfig) -> dict[str, Any]:
@@ -1912,22 +1843,6 @@ class InstrumentedHFBackend:
             self._austeer_artifacts[key] = cached
         return cached
 
-    def _loreft_artifact(
-        self, intervention: InterventionConfig
-    ) -> tuple[dict[str, Any], dict[str, Any]]:
-        if intervention.vector_path is None:
-            raise ValueError("LoReFT intervention requires vector_path")
-        key = str(intervention.vector_path.resolve())
-        cached = self._loreft_artifacts.get(key)
-        if cached is None:
-            cached = load_loreft_artifact(
-                intervention.vector_path,
-                model_id=self.config.model_name_or_path,
-                d_model=self.bundle.lens_model.d_model,
-            )
-            self._loreft_artifacts[key] = cached
-        return cached
-
     @staticmethod
     def _intervention_is_active(
         intervention: InterventionConfig,
@@ -1975,83 +1890,6 @@ class InstrumentedHFBackend:
             raise ValueError(
                 f"intervention layer {intervention.layer} is outside [0, {n_layers})"
             )
-        if intervention.method == "loreft":
-            import torch
-
-            artifact, source = self._loreft_artifact(intervention)
-            layers = [int(value) for value in artifact["layers"]]
-            if any(not 0 <= layer < n_layers for layer in layers):
-                raise ValueError("LoReFT artifact layer is outside the model")
-            parameters = {
-                layer: (
-                    artifact["rotations"][index],
-                    artifact["learned_weights"][index],
-                    artifact["learned_biases"][index],
-                )
-                for index, layer in enumerate(layers)
-            }
-            calls = {layer: 0 for layer in layers}
-            sentinel_layer = min(layers)
-            trace.update(
-                {
-                    "layers": layers,
-                    "rank": int(artifact["rank"]),
-                    "position": "last_prompt_token",
-                    "direction": {
-                        "source": "artifact",
-                        "path": str(intervention.vector_path),
-                        **source,
-                    },
-                }
-            )
-            handles = []
-
-            def make_loreft_hook(layer: int, values: tuple[Any, Any, Any]):
-                rotate, learned_weight, learned_bias = values
-
-                def loreft_hook(_module: Any, _inputs: Any, output: Any) -> Any:
-                    hidden = output if hasattr(output, "shape") else output[0]
-                    if hidden.ndim != 3:
-                        raise ValueError("LoReFT block output must be rank 3")
-                    is_prefill = calls[layer] == 0
-                    calls[layer] += 1
-                    if layer == sentinel_layer:
-                        trace["prefill_calls" if is_prefill else "decode_calls"] += 1
-                    if (is_prefill and not intervention.apply_prefill_decision) or (
-                        not is_prefill and not intervention.apply_decode
-                    ):
-                        return output
-                    modified = hidden.clone()
-                    work = modified[:, -1:, :].float()
-                    rotation = rotate.to(device=hidden.device, dtype=torch.float32)
-                    weight = learned_weight.to(device=hidden.device, dtype=torch.float32)
-                    bias = learned_bias.to(device=hidden.device, dtype=torch.float32)
-                    delta = ((work @ weight.T + bias) - work @ rotation) @ rotation.T
-                    modified[:, -1:, :] = (
-                        work + float(intervention.strength) * delta
-                    ).to(dtype=hidden.dtype)
-                    key = (
-                        "applied_prefill_positions"
-                        if is_prefill
-                        else "applied_decode_positions"
-                    )
-                    trace[key] += int(modified.shape[0])
-                    return modified if hasattr(output, "shape") else (modified, *output[1:])
-
-                return loreft_hook
-
-            try:
-                for layer, values in parameters.items():
-                    handles.append(
-                        self.bundle.lens_model.layers[layer].register_forward_hook(
-                            make_loreft_hook(layer, values)
-                        )
-                    )
-                yield trace
-            finally:
-                for handle in reversed(handles):
-                    handle.remove()
-            return
         if intervention.method == "austeer":
             import torch
 

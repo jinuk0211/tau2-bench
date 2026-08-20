@@ -86,7 +86,7 @@ def test_task18_tool_metric_deltas_are_positive_when_steering_reduces_failures()
 
 @pytest.mark.parametrize(
     "method",
-    ["caa", "cast", "mera", "sadi", "iti", "austeer", "loreft"],
+    ["caa", "cast", "mera", "sadi", "iti", "austeer"],
 )
 def test_all_task18_analyzers_report_tool_failure_reductions(tmp_path, method):
     script = _load_script(f"analyze_airline_task18_{method}.py")
@@ -302,7 +302,6 @@ def test_task18_cast_payment_metric_counts_per_reservation_binding():
     assert score["correct_payment_mapping_count"] == 1
     assert score["correct_by_reservation"] == {"A": True, "B": False}
 
-
 def test_task18_mera_builder_allows_baseline_before_probe_extraction(tmp_path):
     script = _load_script("run_airline_task18_mera.py")
     config = {
@@ -485,56 +484,6 @@ def test_task18_austeer_builder_allows_baseline_before_au_extraction(tmp_path):
 
 def test_task18_austeer_payment_metric_counts_per_reservation_binding():
     script = _load_script("analyze_airline_task18_austeer.py")
-    expected = {"A": "gift_a", "B": "card_b"}
-    messages = [
-        {
-            "role": "assistant",
-            "tool_calls": [
-                {
-                    "name": "update_reservation_flights",
-                    "arguments": {"reservation_id": "A", "payment_id": "gift_a"},
-                },
-                {
-                    "name": "update_reservation_flights",
-                    "arguments": {"reservation_id": "B", "payment_id": "gift_a"},
-                },
-            ],
-        }
-    ]
-
-    score = script._payment_score(messages, expected)
-
-    assert score["correct_payment_mapping_count"] == 1
-    assert score["correct_by_reservation"] == {"A": True, "B": False}
-
-
-def test_task18_loreft_builder_allows_baseline_before_training(tmp_path):
-    script = _load_script("run_airline_task18_loreft.py")
-    config = {
-        "model": {
-            "model_id": "Qwen/Qwen3.5-4B",
-            "model_revision": "a" * 40,
-            "dtype": "bfloat16",
-        },
-        "generation": {"seed": 626729, "do_sample": True},
-        "training": {
-            "layers": [20, 24],
-            "ranks": [1, 4, 8],
-            "primary_rank": 4,
-            "random_seeds": [11, 23, 37],
-        },
-        "causal_turn_index": 9,
-        "causal_boundary": "after_user_message",
-    }
-
-    conditions = script.build_conditions(config, tmp_path)
-
-    assert [condition.name for condition in conditions] == ["baseline"]
-    assert conditions[0].agent_args["jlens_mode"] == "observe"
-
-
-def test_task18_loreft_payment_metric_counts_per_reservation_binding():
-    script = _load_script("analyze_airline_task18_loreft.py")
     expected = {"A": "gift_a", "B": "card_b"}
     messages = [
         {
