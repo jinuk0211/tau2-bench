@@ -75,6 +75,7 @@ def build_agent(
     audio_native_config: Optional[AudioNativeConfig] = None,
     solo_mode: bool = False,
     audio_taps_dir: Optional[Path] = None,
+    simulation_id: Optional[str] = None,
 ) -> Union[HalfDuplexAgent, FullDuplexAgent]:
     """Build an agent from a registered name and an environment.
 
@@ -90,6 +91,7 @@ def build_agent(
         task: The task (required for some agents like llm_agent_gt, llm_agent_solo).
         audio_native_config: Audio config (full-duplex agents).
         solo_mode: If True, agent tools include both agent and user tools.
+        simulation_id: Unique run ID passed to trace-aware agent factories.
 
     Returns:
         A fully constructed agent instance.
@@ -122,6 +124,7 @@ def build_agent(
         task=task,
         audio_native_config=audio_native_config,
         audio_taps_dir=audio_taps_dir,
+        simulation_id=simulation_id,
     )
 
 
@@ -399,6 +402,7 @@ def build_text_orchestrator(
         llm_args=config.llm_args_agent,
         task=task,
         solo_mode=solo_mode,
+        simulation_id=simulation_id,
     )
 
     user = build_user(

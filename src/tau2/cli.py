@@ -684,6 +684,17 @@ def main():
 
     run_parser.set_defaults(func=run_command)
 
+    # Exact-token, all-position Jacobian-lens analysis
+    from tau2.jlens.analysis import configure_parser as configure_jlens_parser
+    from tau2.jlens.analysis import run_from_args as run_jlens_analysis
+
+    jlens_parser = subparsers.add_parser(
+        "jlens",
+        help="Build interactive J-Lens views for every recorded token position",
+    )
+    configure_jlens_parser(jlens_parser)
+    jlens_parser.set_defaults(func=run_jlens_analysis)
+
     # Play command
     play_parser = subparsers.add_parser(
         "play", help="Play manual mode - interact with a domain as the agent"
