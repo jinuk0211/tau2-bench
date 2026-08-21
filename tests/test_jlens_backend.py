@@ -1096,6 +1096,28 @@ def test_generation_uses_tokenizer_chat_eos_instead_of_model_config_eos():
     assert kwargs["do_sample"] is False
 
 
+def test_teacher_forced_measurement_skips_sequences_over_vram_budget():
+    backend = object.__new__(InstrumentedHFBackend)
+    backend.config = HFBackendConfig(
+        model_name_or_path="fake",
+        telemetry_max_sequence_tokens=4,
+    )
+
+    measurement = backend._teacher_forced_measurement(
+        prompt_ids=SimpleNamespace(shape=(1, 3)),
+        generated_ids=[4, 5],
+        position_groups={"initial_decision": [2]},
+    )
+
+    assert measurement["residuals"] == []
+    assert measurement["motorization"] == {}
+    assert measurement["skipped"] == {
+        "reason": "sequence_token_budget",
+        "full_sequence_tokens": 5,
+        "maximum_sequence_tokens": 4,
+    }
+
+
 def test_explicit_generation_stop_tokens_are_preserved():
     tokenizer = SimpleNamespace(eos_token_id=248046, pad_token_id=None)
     config = HFBackendConfig(

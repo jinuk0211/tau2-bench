@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import logging
 import os
 import secrets
@@ -22,6 +23,18 @@ from tau2.agent.jlens_remote_backend import (
 
 LOGGER = logging.getLogger("uvicorn.error")
 GENERATION_HEARTBEAT_SECONDS = 30.0
+
+
+def _release_cuda_cache() -> None:
+    """Release completed/failed generation allocations before the next request."""
+    gc.collect()
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        LOGGER.exception("Failed to release the CUDA cache")
 
 
 def _log_generation_heartbeat(
@@ -127,6 +140,7 @@ def create_app(*, token: str) -> FastAPI:
             # Hooks mutate shared module registration state. Serialize generations
             # until the backend gains a process-per-GPU scheduler.
             with generation_lock:
+                _release_cuda_cache()
                 task_id = str(payload.get("task_id", "unknown"))
                 turn_index = int(payload.get("turn_index", -1))
                 started_at = time.perf_counter()
@@ -163,6 +177,7 @@ def create_app(*, token: str) -> FastAPI:
                 finally:
                     stop_heartbeat.set()
                     heartbeat.join(timeout=1.0)
+                    _release_cuda_cache()
                 LOGGER.info(
                     "Qwen generation completed task=%s turn=%s elapsed=%.1fs tokens=%s",
                     task_id,

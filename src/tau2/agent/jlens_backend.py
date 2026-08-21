@@ -297,6 +297,7 @@ class HFBackendConfig:
     selected_layers: tuple[int, ...] = ()
     concept_tokens: dict[str, str | int] = field(default_factory=dict)
     telemetry_path: Optional[Path] = None
+    telemetry_max_sequence_tokens: int = 8192
     lens_path: Optional[Path] = None
     intervention: Optional[InterventionConfig] = None
     controller: Optional[JServoConfig] = None
@@ -317,6 +318,8 @@ class HFBackendConfig:
             raise ValueError("interventions and controllers are valid only in intervene mode")
         if self.max_input_tokens <= 0:
             raise ValueError("max_input_tokens must be positive")
+        if self.telemetry_max_sequence_tokens <= 0:
+            raise ValueError("telemetry_max_sequence_tokens must be positive")
         if self.sdpa_backend not in {"auto", "efficient", "flash", "math"}:
             raise ValueError(f"unknown SDPA backend: {self.sdpa_backend}")
 
@@ -2593,7 +2596,6 @@ class InstrumentedHFBackend:
         position_groups: dict[str, list[int]],
     ) -> dict[str, Any]:
         import torch
-        from jlens.hooks import ActivationRecorder
 
         if not generated_ids:
             return {
@@ -2601,6 +2603,20 @@ class InstrumentedHFBackend:
                 "residuals": [],
                 "motorization": {},
             }
+        full_sequence_tokens = int(prompt_ids.shape[1]) + len(generated_ids)
+        if full_sequence_tokens > self.config.telemetry_max_sequence_tokens:
+            return {
+                "positions": position_groups,
+                "residuals": [],
+                "motorization": {},
+                "skipped": {
+                    "reason": "sequence_token_budget",
+                    "full_sequence_tokens": full_sequence_tokens,
+                    "maximum_sequence_tokens": self.config.telemetry_max_sequence_tokens,
+                },
+            }
+        from jlens.hooks import ActivationRecorder
+
         generated = torch.tensor(
             [generated_ids], device=prompt_ids.device, dtype=prompt_ids.dtype
         )

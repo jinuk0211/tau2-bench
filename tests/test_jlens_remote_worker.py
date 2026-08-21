@@ -104,3 +104,23 @@ def test_generation_heartbeat_reports_task_turn_and_elapsed(monkeypatch):
     assert "task=33" in messages[0]
     assert "turn=4" in messages[0]
     assert "elapsed=" in messages[0]
+
+
+def test_cuda_cache_release_collects_and_empties_cache(monkeypatch):
+    script = _load_script()
+    calls = []
+    monkeypatch.setattr(script.gc, "collect", lambda: calls.append("gc"))
+    monkeypatch.setitem(
+        sys.modules,
+        "torch",
+        SimpleNamespace(
+            cuda=SimpleNamespace(
+                is_available=lambda: True,
+                empty_cache=lambda: calls.append("cuda"),
+            )
+        ),
+    )
+
+    script._release_cuda_cache()
+
+    assert calls == ["gc", "cuda"]
