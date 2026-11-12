@@ -46,6 +46,8 @@ from tau2.data_model.message import (
 )
 from tau2.environment.tool import Tool
 
+OFFICIAL_METHODS = frozenset({"caa", "cast", "mera", "sadi", "iti", "austeer"})
+
 
 class InstrumentationMode(str, Enum):
     """Generation mode for the shared backend."""
@@ -92,8 +94,27 @@ class InterventionConfig:
     boundaries: tuple[str, ...] = ()
     apply_prefill_decision: bool = True
     apply_decode: bool = True
+    # "official" runs the baseline through each paper's own pinned code via
+    # jlens_causal.official (see OFFICIAL_BASELINES.md in jlens-causal-steering).
+    implementation: Literal["reimplementation", "official"] = "reimplementation"
+    official_options: dict[str, Any] = field(default_factory=dict, hash=False)
 
     def __post_init__(self) -> None:
+        if self.implementation not in {"reimplementation", "official"}:
+            raise ValueError("implementation must be 'reimplementation' or 'official'")
+        if self.implementation == "official":
+            if self.method not in OFFICIAL_METHODS:
+                raise ValueError(
+                    f"official baselines support {sorted(OFFICIAL_METHODS)}"
+                )
+            if self.vector_path is None:
+                raise ValueError(
+                    "official baselines need a fitted artifact in vector_path"
+                )
+            if self.kind != "steer":
+                raise ValueError("official baselines support kind='steer' only")
+            if not isinstance(self.official_options, dict):
+                raise ValueError("official_options must be an object")
         sources = sum(
             value is not None
             for value in (
@@ -268,6 +289,10 @@ class InterventionConfig:
                         )
                     )
             copied["iti_entries"] = tuple(entries)
+        if copied.get("official_options") is not None:
+            if not isinstance(copied["official_options"], dict):
+                raise ValueError("official_options must be an object")
+            copied["official_options"] = dict(copied["official_options"])
         if copied.get("austeer_units") is not None:
             if isinstance(copied["austeer_units"], (str, bytes)):
                 raise ValueError("austeer_units must be a sequence")
@@ -1544,7 +1569,13 @@ class InstrumentedHFBackend:
         return cached
 
     @contextmanager
-    def _generation_control(self, *, turn_index: int, boundaries: Sequence[str]):
+    def _generation_control(
+        self,
+        *,
+        turn_index: int,
+        boundaries: Sequence[str],
+        prompt_ids: Optional[Sequence[int]] = None,
+    ):
         """Install exactly one legacy intervention or adaptive J-Servo controller."""
         controller = self.config.controller
         if controller is not None:
@@ -1576,6 +1607,7 @@ class InstrumentedHFBackend:
         with self._intervention_hook(
             active=active,
             selection_reason=reason,
+            prompt_ids=prompt_ids,
         ) as intervention_trace:
             yield (
                 intervention_trace,
@@ -1862,7 +1894,13 @@ class InstrumentedHFBackend:
         return True, "selected"
 
     @contextmanager
-    def _intervention_hook(self, *, active: bool, selection_reason: str):
+    def _intervention_hook(
+        self,
+        *,
+        active: bool,
+        selection_reason: str,
+        prompt_ids: Optional[Sequence[int]] = None,
+    ):
         intervention = self.config.intervention
         if intervention is None:
             yield {"requested": False, "active": False, "reason": "not_configured"}
@@ -1893,6 +1931,31 @@ class InstrumentedHFBackend:
             raise ValueError(
                 f"intervention layer {intervention.layer} is outside [0, {n_layers})"
             )
+        if intervention.implementation == "official":
+            from jlens_causal.official.runtime import official_steering
+
+            if prompt_ids is None:
+                raise ValueError("official baselines need the rendered prompt token IDs")
+            trace["implementation"] = "official"
+            trace["official_options"] = dict(intervention.official_options)
+            with official_steering(
+                model=self.bundle.model,
+                tokenizer=self.bundle.tokenizer,
+                method=intervention.method,
+                artifact_path=intervention.vector_path,
+                model_id=self.config.model_name_or_path,
+                strength=intervention.strength,
+                layer=intervention.layer,
+                prompt_ids=list(prompt_ids),
+                options=dict(intervention.official_options),
+            ) as official_trace:
+                trace["official"] = official_trace
+                yield trace
+            # analyze_airline_failure_steering.py verifies dose from applied_* keys.
+            trace["applied_official_edits"] = int(
+                official_trace.get("applied_edits", 0)
+            )
+            return
         if intervention.method == "austeer":
             import torch
 
@@ -2733,6 +2796,7 @@ class InstrumentedHFBackend:
             self._generation_control(
                 turn_index=turn_index,
                 boundaries=boundaries,
+                prompt_ids=prompt_ids,
             ) as control_traces,
         ):
             generated = self.bundle.model.generate(
