@@ -10,16 +10,18 @@ differ only in what happens on triggered turns):
 
 The user simulator is the same Qwen3.5-4B weights served in-process
 (``--user-llm localhf/...``, greedy, thinking off), so episodes are
-deterministic and conditions are paired per task.  Pass ``--conditions`` and
-``--task-ids`` to split the work across GPUs.
+deterministic and conditions are paired per task.
+
+Tasks run one at a time, every condition back to back, inside this process
+(the model bundle is loaded once and shared).  Each (condition, task) is saved
+to its own results file and skipped when it already exists, so a run can be
+restarted and split across GPUs with ``--task-ids``.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import os
-import subprocess
 import sys
 from pathlib import Path
 
@@ -50,6 +52,58 @@ def intervention(name: str, args: argparse.Namespace) -> dict:
     raise ValueError(f"unknown condition {name}")
 
 
+def tau2_argv(name: str, task_id: str, args: argparse.Namespace) -> list[str]:
+    agent_args = {
+        "hf_dtype": args.dtype,
+        "hf_chat_template_kwargs": {"enable_thinking": False},
+        "hf_max_input_tokens": 32768,
+        "hf_prefill_chunk": args.prefill_chunk,
+        "do_sample": False,
+        "max_new_tokens": args.max_new_tokens,
+        "max_time": 300,
+        "seed": 300,
+        "use_cache": True,
+        "jlens_path": str(args.lens),
+        "jlens_mode": "intervene",
+        "jlens_measure": False,
+        "jlens_telemetry_path": str(
+            args.telemetry_root / args.save_prefix / name / "{task_id}-{simulation_id}.jsonl"
+        ),
+        "jlens_intervention": intervention(name, args),
+    }
+    if args.revision and not Path(args.model).is_dir():
+        agent_args["hf_revision"] = args.revision
+    return [
+        "tau2", "run",
+        "--domain", "airline", "--task-set-name", "airline", "--task-split-name", "base",
+        "--task-ids", task_id,
+        "--num-trials", "1",
+        "--agent", "jlens_hf_agent",
+        "--agent-llm", args.model,
+        "--agent-llm-args", json.dumps(agent_args, separators=(",", ":")),
+        "--user", "user_simulator",
+        "--user-llm", "localhf/qwen3.5-4b",
+        "--user-llm-args", "{}",
+        "--max-steps", "200",
+        "--timeout", "3600",
+        "--max-retries", "0",
+        "--max-concurrency", "1",
+        "--seed", "300",
+        "--save-to", f"{args.save_prefix}/{name}/task_{task_id}",
+    ]
+
+
+def finished(save_to: str) -> bool:
+    path = Path("data/simulations") / save_to / "results.json"
+    if not path.is_file():
+        return False
+    try:
+        sims = json.loads(path.read_text(encoding="utf-8")).get("simulations") or []
+    except json.JSONDecodeError:
+        return False
+    return any((sim.get("reward_info") or {}).get("reward") is not None for sim in sims)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--model", default="Qwen/Qwen3.5-4B",
@@ -71,54 +125,25 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
-    for name in args.conditions:
-        agent_args = {
-            "hf_dtype": args.dtype,
-            "hf_chat_template_kwargs": {"enable_thinking": False},
-            "hf_max_input_tokens": 32768,
-            "hf_prefill_chunk": args.prefill_chunk,
-            "do_sample": False,
-            "max_new_tokens": args.max_new_tokens,
-            "max_time": 300,
-            "seed": 300,
-            "use_cache": True,
-            "jlens_path": str(args.lens),
-            "jlens_mode": "intervene",
-            "jlens_measure": False,
-            "jlens_telemetry_path": str(
-                args.telemetry_root / args.save_prefix / name / "{task_id}-{simulation_id}.jsonl"
-            ),
-            "jlens_intervention": intervention(name, args),
-        }
-        if args.revision and not Path(args.model).is_dir():
-            agent_args["hf_revision"] = args.revision
-        command = [
-            sys.executable, "-m", "tau2.cli", "run",
-            "--domain", "airline", "--task-set-name", "airline", "--task-split-name", "base",
-            "--task-ids", *args.task_ids,
-            "--num-trials", "1",
-            "--agent", "jlens_hf_agent",
-            "--agent-llm", args.model,
-            "--agent-llm-args", json.dumps(agent_args, separators=(",", ":")),
-            "--user", "user_simulator",
-            "--user-llm", "localhf/qwen3.5-4b",
-            "--user-llm-args", "{}",
-            "--max-steps", "200",
-            "--timeout", "3600",
-            "--max-retries", "0",
-            "--max-concurrency", "1",
-            "--seed", "300",
-            "--save-to", f"{args.save_prefix}/{name}",
-            "--auto-resume",
-        ]
-        print(f"== {name}: {len(args.task_ids)} tasks", flush=True)
-        if args.dry_run:
-            print(" ".join(command))
-            continue
-        result = subprocess.run(command, env=os.environ.copy())
-        if result.returncode != 0:
-            print(f"condition {name} exited with {result.returncode}", flush=True)
-            return result.returncode
+    from tau2.cli import main as tau2_main
+
+    for task_id in args.task_ids:
+        for name in args.conditions:
+            argv = tau2_argv(name, task_id, args)
+            save_to = argv[argv.index("--save-to") + 1]
+            if finished(save_to):
+                print(f"== task {task_id} {name}: done, skipping", flush=True)
+                continue
+            print(f"== task {task_id} {name}", flush=True)
+            if args.dry_run:
+                print(" ".join(argv))
+                continue
+            sys.argv = argv
+            try:
+                tau2_main()
+            except SystemExit as stop:
+                if stop.code not in (None, 0):
+                    print(f"task {task_id} {name} exited with {stop.code}", flush=True)
     return 0
 
 
