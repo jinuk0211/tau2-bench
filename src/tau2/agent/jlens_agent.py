@@ -51,6 +51,7 @@ _BACKEND_KEYS = {
     "jlens_remote_timeout_seconds",
     "jlens_remote_token_env",
     "jlens_require_remote",
+    "jlens_measure",
 }
 
 
@@ -206,6 +207,7 @@ def backend_config_from_agent_args(
         dtype=backend_args.get("hf_dtype", "auto"),
         sdpa_backend=backend_args.get("hf_sdpa_backend", "auto"),
         trust_remote_code=bool(backend_args.get("hf_trust_remote_code", False)),
+        measure=bool(backend_args.get("jlens_measure", True)),
     )
 
 

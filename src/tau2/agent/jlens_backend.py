@@ -20,6 +20,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import re
 import threading
 import time
@@ -98,10 +99,43 @@ class InterventionConfig:
     # jlens_causal.official (see OFFICIAL_BASELINES.md in jlens-causal-steering).
     implementation: Literal["reimplementation", "official"] = "reimplementation"
     official_options: dict[str, Any] = field(default_factory=dict, hash=False)
+    # Vocabulary trigger (jlens_causal.vocab_trigger.TriggerSpec JSON).  A scoring
+    # pass reads the J-lens risk-minus-safe score at the decision point (last prompt
+    # token) and the intervention runs only on turns whose score exceeds the
+    # threshold.  Any method can be gated this way.
+    trigger_spec_path: Optional[Path] = None
+    trigger_threshold_override: Optional[float] = None
+    # method "jlens_vocab": h <- h + strength * ||h|| * d at ``layer``, with
+    # d = normalize(J_layer^T (mean W_U[safe] - mean W_U[risk])) from the trigger
+    # spec ("concept") or a seeded random unit vector ("random").  Prefill edits only
+    # the decision position; every decode position is edited.
+    jlens_direction: Literal["concept", "random"] = "concept"
 
     def __post_init__(self) -> None:
         if self.implementation not in {"reimplementation", "official"}:
             raise ValueError("implementation must be 'reimplementation' or 'official'")
+        if self.method == "jlens_vocab":
+            if self.trigger_spec_path is None:
+                raise ValueError("jlens_vocab needs trigger_spec_path (its vocabulary)")
+            if self.kind != "steer" or self.implementation != "reimplementation":
+                raise ValueError("jlens_vocab supports kind='steer' only")
+            if self.jlens_direction not in {"concept", "random"}:
+                raise ValueError("jlens_direction must be 'concept' or 'random'")
+            if any(
+                value is not None
+                for value in (
+                    self.concept_token_id,
+                    self.vector,
+                    self.vector_path,
+                    self.sadi_units,
+                    self.iti_entries,
+                    self.austeer_units,
+                )
+            ):
+                raise ValueError("jlens_vocab derives its direction from the trigger spec")
+            if self.layer < 0 or not math.isfinite(self.strength):
+                raise ValueError("jlens_vocab needs a non-negative layer and finite strength")
+            return
         if self.implementation == "official":
             if self.method not in OFFICIAL_METHODS:
                 raise ValueError(
@@ -251,6 +285,8 @@ class InterventionConfig:
             copied["vector"] = tuple(float(item) for item in copied["vector"])
         if copied.get("vector_path") is not None:
             copied["vector_path"] = Path(copied["vector_path"])
+        if copied.get("trigger_spec_path") is not None:
+            copied["trigger_spec_path"] = Path(copied["trigger_spec_path"])
         if copied.get("turn_indices") is not None:
             if isinstance(copied["turn_indices"], (str, bytes)):
                 raise ValueError("turn_indices must be a sequence of integers")
@@ -332,6 +368,9 @@ class HFBackendConfig:
     dtype: str = "auto"
     sdpa_backend: Literal["auto", "efficient", "flash", "math"] = "auto"
     trust_remote_code: bool = False
+    # False skips the teacher-forced residual measurement after each turn (an extra
+    # full forward pass); generation is unaffected.
+    measure: bool = True
 
     def __post_init__(self) -> None:
         controls = int(self.intervention is not None) + int(self.controller is not None)
@@ -402,6 +441,30 @@ class _ModelBundle:
 
 _BUNDLE_CACHE: dict[tuple[Any, ...], _ModelBundle] = {}
 _BUNDLE_CACHE_LOCK = threading.Lock()
+
+
+class _StopForward(Exception):
+    """Raised from a hook to end a scoring forward pass at the observe layer."""
+
+
+def _final_norm(model: Any) -> Any:
+    for path in (("model", "norm"), ("model", "language_model", "norm"), ("language_model", "norm")):
+        current = model
+        for name in path:
+            current = getattr(current, name, None)
+        if current is not None and hasattr(current, "weight"):
+            return current
+    raise AttributeError("final norm not found")
+
+
+def shared_bundle() -> _ModelBundle:
+    """The one loaded model bundle, for components that reuse the agent's weights
+    (the local user simulator).  Fails unless exactly one bundle is loaded."""
+    with _BUNDLE_CACHE_LOCK:
+        bundles = list(_BUNDLE_CACHE.values())
+    if len(bundles) != 1:
+        raise RuntimeError(f"expected exactly one loaded model bundle, found {len(bundles)}")
+    return bundles[0]
 _PATH_LOCKS: dict[str, threading.Lock] = {}
 _PATH_LOCKS_LOCK = threading.Lock()
 _STEERING_ARTIFACT_SCHEMA = "agent-steering-vector-v1"
@@ -1419,13 +1482,47 @@ def _load_bundle(config: HFBackendConfig) -> _ModelBundle:
         attention_name = "jlens_expanded_gqa_sdpa"
         ALL_ATTENTION_FUNCTIONS.register(attention_name, expanded_gqa_sdpa_forward)
         model_kwargs["attn_implementation"] = attention_name
-    model = AutoModelForCausalLM.from_pretrained(
-        config.model_name_or_path,
-        revision=config.revision,
-        dtype=dtype,
-        trust_remote_code=config.trust_remote_code,
-        **model_kwargs,
-    )
+    # Text-only Qwen3.5 (no vision tower).  JLENS_STREAM_WEIGHTS=1 streams the Hub
+    # shards straight into device memory for hosts whose disk cannot hold them.
+    loader = os.environ.get("JLENS_MODEL_LOADER", "auto")
+    if loader == "stream":
+        from huggingface_hub import snapshot_download
+        from jlens_causal.hf_stream import stream_qwen35_text_model
+
+        config_dir = snapshot_download(
+            config.model_name_or_path,
+            revision=config.revision,
+            allow_patterns=["*.json", "*.txt", "*.jinja", "tokenizer*"],
+        )
+        model = stream_qwen35_text_model(
+            config.model_name_or_path,
+            config.revision,
+            config_dir,
+            device=device,
+            dtype=dtype,
+        )
+    elif loader == "text_only":
+        from transformers import Qwen3_5Config, Qwen3_5ForCausalLM
+
+        text_config = Qwen3_5Config.from_pretrained(
+            config.model_name_or_path, revision=config.revision
+        ).text_config
+        model = Qwen3_5ForCausalLM.from_pretrained(
+            config.model_name_or_path,
+            revision=config.revision,
+            config=text_config,
+            dtype=dtype,
+            key_mapping={r"^model\.language_model\.": "model."},
+            **model_kwargs,
+        )
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            config.model_name_or_path,
+            revision=config.revision,
+            dtype=dtype,
+            trust_remote_code=config.trust_remote_code,
+            **model_kwargs,
+        )
     model.to(device)
     model.eval()
     lens_model = jlens.from_hf(model, tokenizer, force_bos=False)
@@ -1546,6 +1643,7 @@ class InstrumentedHFBackend:
             tuple[str, Optional[int]], tuple[dict[str, Any], dict[str, Any]]
         ] = {}
         self._jservo_artifacts: dict[str, dict[str, Any]] = {}
+        self._vocab_states: dict[tuple[str, int, str], dict[str, Any]] = {}
 
     def _jservo_artifact(self, controller: JServoConfig) -> dict[str, Any]:
         key = str(controller.artifact_path)
@@ -1604,11 +1702,22 @@ class InstrumentedHFBackend:
                 turn_index=turn_index,
                 boundaries=boundaries,
             )
+        trigger: dict[str, Any] = {}
+        if (
+            intervention is not None
+            and intervention.trigger_spec_path is not None
+            and prompt_ids is not None
+        ):
+            trigger = self._vocab_trigger_gate(intervention, prompt_ids)
+            if active and not trigger["triggered"]:
+                active, reason = False, "trigger_below_threshold"
         with self._intervention_hook(
             active=active,
             selection_reason=reason,
             prompt_ids=prompt_ids,
         ) as intervention_trace:
+            if trigger:
+                intervention_trace["vocab_trigger"] = trigger
             yield (
                 intervention_trace,
                 {
@@ -1617,6 +1726,87 @@ class InstrumentedHFBackend:
                     "reason": "not_configured",
                 },
             )
+
+    def _vocab_state(self, intervention: InterventionConfig) -> dict[str, Any]:
+        """Trigger spec, readout head, threshold and steering direction (cached)."""
+        key = (
+            str(intervention.trigger_spec_path),
+            int(intervention.layer),
+            intervention.jlens_direction,
+        )
+        cached = self._vocab_states.get(key)
+        if cached is not None:
+            return cached
+        from jlens_causal.vocab_trigger import (
+            ReadoutHead,
+            TriggerSpec,
+            concept_direction,
+            random_direction,
+        )
+
+        if self.bundle.lens is None:
+            raise ValueError("the vocabulary trigger needs jlens_path (the Jacobian lens)")
+        spec = TriggerSpec.load(intervention.trigger_spec_path)
+        norm = _final_norm(self.bundle.model)
+        head = ReadoutHead(
+            norm_weight=norm.weight.detach().float(),
+            eps=float(getattr(norm, "eps", getattr(norm, "variance_epsilon", 1e-6))),
+            unembed=self.bundle.model.get_output_embeddings().weight.detach(),
+        )
+        threshold = (
+            float(intervention.trigger_threshold_override)
+            if intervention.trigger_threshold_override is not None
+            else float(spec.threshold)
+        )
+        direction = None
+        if intervention.method == "jlens_vocab":
+            if intervention.layer not in self.bundle.lens.jacobians:
+                raise ValueError(f"the lens has no Jacobian for layer {intervention.layer}")
+            direction = concept_direction(self.bundle.lens, head, spec, intervention.layer)
+            if intervention.jlens_direction == "random":
+                direction = random_direction(direction, seed=0)
+        cached = {"spec": spec, "head": head, "threshold": threshold, "direction": direction}
+        self._vocab_states[key] = cached
+        return cached
+
+    def _vocab_trigger_gate(
+        self, intervention: InterventionConfig, prompt_ids: Sequence[int]
+    ) -> dict[str, Any]:
+        """Score the decision point with a forward pass that stops at the observe layer."""
+        import torch
+
+        state = self._vocab_state(intervention)
+        spec = state["spec"]
+        blocks = self.bundle.lens_model.layers
+        captured: dict[str, Any] = {}
+
+        def hook(module: Any, args: Any, output: Any) -> None:  # noqa: ARG001
+            hidden = output[0] if isinstance(output, tuple) else output
+            captured["hidden"] = hidden[0, -1].detach()
+            raise _StopForward
+
+        started = time.perf_counter()
+        handle = blocks[spec.observe_layer].register_forward_hook(hook)
+        try:
+            with torch.no_grad(), self._sdpa_kernel():
+                self.bundle.model(
+                    input_ids=torch.tensor(
+                        [list(prompt_ids)], device=self.bundle.model.device
+                    ),
+                    use_cache=False,
+                )
+        except _StopForward:
+            pass
+        finally:
+            handle.remove()
+        score = spec.score_hidden(self.bundle.lens, state["head"], captured["hidden"])
+        return {
+            "observe_layer": int(spec.observe_layer),
+            "score": float(score),
+            "threshold": state["threshold"],
+            "triggered": bool(score > state["threshold"]),
+            "gate_seconds": round(time.perf_counter() - started, 3),
+        }
 
     @classmethod
     def from_pretrained(cls, config: HFBackendConfig) -> "InstrumentedHFBackend":
@@ -1931,6 +2121,38 @@ class InstrumentedHFBackend:
             raise ValueError(
                 f"intervention layer {intervention.layer} is outside [0, {n_layers})"
             )
+        if intervention.method == "jlens_vocab":
+            alpha = float(intervention.strength)
+            trace["jlens_direction"] = intervention.jlens_direction
+            if alpha == 0.0:
+                # Detect-only: no hook, so decoding is bit-identical to no intervention.
+                yield trace
+                return
+            direction = self._vocab_state(intervention)["direction"]
+
+            def vocab_hook(module: Any, args: Any, output: Any) -> Any:  # noqa: ARG001
+                tensor = output[0] if isinstance(output, tuple) else output
+                d = direction.to(device=tensor.device, dtype=tensor.dtype)
+                modified = tensor.clone()
+                if tensor.shape[1] > 1:
+                    trace["prefill_calls"] += 1
+                    last = tensor[:, -1:, :]
+                    modified[:, -1:, :] = last + alpha * last.norm(dim=-1, keepdim=True) * d
+                    trace["applied_prefill_positions"] += 1
+                else:
+                    trace["decode_calls"] += 1
+                    modified = tensor + alpha * tensor.norm(dim=-1, keepdim=True) * d
+                    trace["applied_decode_positions"] += int(tensor.shape[1])
+                return _replace_block_output(output, modified)
+
+            handle = self.bundle.lens_model.layers[intervention.layer].register_forward_hook(
+                vocab_hook
+            )
+            try:
+                yield trace
+            finally:
+                handle.remove()
+            return
         if intervention.implementation == "official":
             from jlens_causal.official.runtime import official_steering
 
@@ -2839,7 +3061,7 @@ class InstrumentedHFBackend:
         )
 
         measurement: dict[str, Any] = {}
-        if self.config.mode in {
+        if self.config.measure and self.config.mode in {
             InstrumentationMode.OBSERVE,
             InstrumentationMode.INTERVENE,
         }:

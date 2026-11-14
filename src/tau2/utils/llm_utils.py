@@ -376,6 +376,10 @@ def generate(
     Returns: A tuple containing the message and the cost.
     """
     validate_message_history(messages)
+    from tau2.utils.local_hf_llm import generate_local_hf, is_local_hf
+
+    if is_local_hf(model):
+        return generate_local_hf(model, messages, tools=tools, **kwargs)
     if kwargs.get("num_retries") is None:
         kwargs["num_retries"] = DEFAULT_MAX_RETRIES
 
