@@ -52,6 +52,7 @@ _BACKEND_KEYS = {
     "jlens_remote_token_env",
     "jlens_require_remote",
     "jlens_measure",
+    "hf_prefill_chunk",
 }
 
 
@@ -208,6 +209,7 @@ def backend_config_from_agent_args(
         sdpa_backend=backend_args.get("hf_sdpa_backend", "auto"),
         trust_remote_code=bool(backend_args.get("hf_trust_remote_code", False)),
         measure=bool(backend_args.get("jlens_measure", True)),
+        prefill_chunk=int(backend_args.get("hf_prefill_chunk", 0)),
     )
 
 

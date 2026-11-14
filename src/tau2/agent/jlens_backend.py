@@ -371,6 +371,10 @@ class HFBackendConfig:
     # False skips the teacher-forced residual measurement after each turn (an extra
     # full forward pass); generation is unaffected.
     measure: bool = True
+    # >0: prefill prompt[:-1] in chunks of this many tokens (bounded memory for
+    # long Tau2 contexts); generate() then starts from that cache at the decision
+    # token.  Hooks that edit prefill positions see the same absolute positions.
+    prefill_chunk: int = 0
 
     def __post_init__(self) -> None:
         controls = int(self.intervention is not None) + int(self.controller is not None)
@@ -1673,9 +1677,17 @@ class InstrumentedHFBackend:
         turn_index: int,
         boundaries: Sequence[str],
         prompt_ids: Optional[Sequence[int]] = None,
+        prefix: Optional[dict[str, Any]] = None,
     ):
-        """Install exactly one legacy intervention or adaptive J-Servo controller."""
+        """Install exactly one legacy intervention or adaptive J-Servo controller.
+
+        ``prefix`` is an unhooked cache of ``prompt[:-1]`` (chunked prefill).  It is
+        marked reusable only when no installed hook edits a prefill position before
+        the decision token; otherwise generate() re-prefills under the hooks.
+        """
         controller = self.config.controller
+        if prefix is not None:
+            prefix["reusable"] = False
         if controller is not None:
             artifact = self._jservo_artifact(controller)
             with jservo_generation_hooks(
@@ -1708,16 +1720,24 @@ class InstrumentedHFBackend:
             and intervention.trigger_spec_path is not None
             and prompt_ids is not None
         ):
-            trigger = self._vocab_trigger_gate(intervention, prompt_ids)
+            trigger = self._vocab_trigger_gate(intervention, prompt_ids, prefix)
             if active and not trigger["triggered"]:
                 active, reason = False, "trigger_below_threshold"
+        reuse = prefix is not None and (
+            not active or (intervention is not None and intervention.method == "jlens_vocab")
+        )
+        if prefix is not None:
+            prefix["reusable"] = reuse
         with self._intervention_hook(
             active=active,
             selection_reason=reason,
             prompt_ids=prompt_ids,
+            position_offset=int(prefix["length"]) if reuse else 0,
         ) as intervention_trace:
             if trigger:
                 intervention_trace["vocab_trigger"] = trigger
+            if prefix is not None:
+                intervention_trace["prefix_cache_reused"] = reuse
             yield (
                 intervention_trace,
                 {
@@ -1769,10 +1789,33 @@ class InstrumentedHFBackend:
         self._vocab_states[key] = cached
         return cached
 
+    def _prefill(self, input_ids: Any, chunk: int) -> Any:
+        """Cache for ``input_ids`` built chunk by chunk (whatever hooks are installed)."""
+        import torch
+
+        cache = None
+        with torch.no_grad():
+            for start in range(0, int(input_ids.shape[1]), chunk):
+                cache = self.bundle.model(
+                    input_ids=input_ids[:, start : start + chunk],
+                    past_key_values=cache,
+                    use_cache=True,
+                    logits_to_keep=1,
+                ).past_key_values
+        return cache
+
     def _vocab_trigger_gate(
-        self, intervention: InterventionConfig, prompt_ids: Sequence[int]
+        self,
+        intervention: InterventionConfig,
+        prompt_ids: Sequence[int],
+        prefix: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
-        """Score the decision point with a forward pass that stops at the observe layer."""
+        """Score the decision point with a forward pass that stops at the observe layer.
+
+        With a prefix cache only the decision token is run (on a copy of the cache).
+        """
+        import copy
+
         import torch
 
         state = self._vocab_state(intervention)
@@ -1786,15 +1829,21 @@ class InstrumentedHFBackend:
             raise _StopForward
 
         started = time.perf_counter()
+        device = self.bundle.model.device
         handle = blocks[spec.observe_layer].register_forward_hook(hook)
         try:
             with torch.no_grad(), self._sdpa_kernel():
-                self.bundle.model(
-                    input_ids=torch.tensor(
-                        [list(prompt_ids)], device=self.bundle.model.device
-                    ),
-                    use_cache=False,
-                )
+                if prefix is not None:
+                    self.bundle.model(
+                        input_ids=torch.tensor([[int(prompt_ids[-1])]], device=device),
+                        past_key_values=copy.deepcopy(prefix["cache"]),
+                        use_cache=True,
+                    )
+                else:
+                    self.bundle.model(
+                        input_ids=torch.tensor([list(prompt_ids)], device=device),
+                        use_cache=False,
+                    )
         except _StopForward:
             pass
         finally:
@@ -2090,6 +2139,7 @@ class InstrumentedHFBackend:
         active: bool,
         selection_reason: str,
         prompt_ids: Optional[Sequence[int]] = None,
+        position_offset: int = 0,
     ):
         intervention = self.config.intervention
         if intervention is None:
@@ -2129,20 +2179,33 @@ class InstrumentedHFBackend:
                 yield trace
                 return
             direction = self._vocab_state(intervention)["direction"]
+            if prompt_ids is None:
+                raise ValueError("jlens_vocab needs the prompt token IDs")
+            decision = len(prompt_ids) - 1
+            # Absolute position of the next token this block will see; a reused
+            # prefix cache already holds positions [0, position_offset).
+            seen = {"position": int(position_offset)}
 
             def vocab_hook(module: Any, args: Any, output: Any) -> Any:  # noqa: ARG001
                 tensor = output[0] if isinstance(output, tuple) else output
+                start = seen["position"]
+                width = int(tensor.shape[1])
+                seen["position"] += width
+                first = max(0, decision - start)
+                if start + width <= decision:
+                    trace["prefill_calls"] += 1
+                    return output
                 d = direction.to(device=tensor.device, dtype=tensor.dtype)
                 modified = tensor.clone()
-                if tensor.shape[1] > 1:
+                part = tensor[:, first:, :]
+                modified[:, first:, :] = part + alpha * part.norm(dim=-1, keepdim=True) * d
+                if start <= decision:
                     trace["prefill_calls"] += 1
-                    last = tensor[:, -1:, :]
-                    modified[:, -1:, :] = last + alpha * last.norm(dim=-1, keepdim=True) * d
                     trace["applied_prefill_positions"] += 1
+                    trace["applied_decode_positions"] += width - first - 1
                 else:
                     trace["decode_calls"] += 1
-                    modified = tensor + alpha * tensor.norm(dim=-1, keepdim=True) * d
-                    trace["applied_decode_positions"] += int(tensor.shape[1])
+                    trace["applied_decode_positions"] += width - first
                 return _replace_block_output(output, modified)
 
             handle = self.bundle.lens_model.layers[intervention.layer].register_forward_hook(
@@ -3013,19 +3076,38 @@ class InstrumentedHFBackend:
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(self.config.seed)
         start = time.perf_counter()
+        chunk = int(self.config.prefill_chunk)
+        prefix: Optional[dict[str, Any]] = None
+        if chunk > 0 and int(input_ids.shape[1]) > 1:
+            with self._sdpa_kernel():
+                prefix = {
+                    "cache": self._prefill(input_ids[:, :-1], chunk),
+                    "length": int(input_ids.shape[1]) - 1,
+                }
         with (
             self._sdpa_kernel(),
             self._generation_control(
                 turn_index=turn_index,
                 boundaries=boundaries,
                 prompt_ids=prompt_ids,
+                prefix=prefix,
             ) as control_traces,
         ):
+            extra: dict[str, Any] = {}
+            if prefix is not None:
+                if not prefix["reusable"]:
+                    # A hook edits prefill positions: rebuild the prefix under it.
+                    prefix["cache"] = None
+                    prefix["cache"] = self._prefill(input_ids[:, :-1], chunk)
+                extra["past_key_values"] = prefix["cache"]
             generated = self.bundle.model.generate(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 **generation_kwargs,
+                **extra,
             )
+            del extra
+            prefix = None
         duration = time.perf_counter() - start
         intervention_trace, controller_trace = control_traces
         sequences = (

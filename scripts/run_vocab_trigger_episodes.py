@@ -67,6 +67,7 @@ def main() -> int:
     parser.add_argument("--save-prefix", default="vocab-trigger")
     parser.add_argument("--telemetry-root", type=Path, default=Path("data/jlens-telemetry"))
     parser.add_argument("--max-new-tokens", type=int, default=4096)
+    parser.add_argument("--prefill-chunk", type=int, default=4096)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
@@ -75,6 +76,7 @@ def main() -> int:
             "hf_dtype": args.dtype,
             "hf_chat_template_kwargs": {"enable_thinking": False},
             "hf_max_input_tokens": 32768,
+            "hf_prefill_chunk": args.prefill_chunk,
             "do_sample": False,
             "max_new_tokens": args.max_new_tokens,
             "max_time": 300,
