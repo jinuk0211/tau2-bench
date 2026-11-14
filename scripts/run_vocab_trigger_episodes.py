@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import sys
 from pathlib import Path
 
@@ -138,6 +139,10 @@ def main() -> int:
             if args.dry_run:
                 print(" ".join(argv))
                 continue
+            partial = Path("data/simulations") / save_to
+            if partial.exists():
+                # An interrupted episode: start it over (tau2 would prompt to resume).
+                shutil.rmtree(partial)
             sys.argv = argv
             try:
                 tau2_main()
